@@ -1,13 +1,16 @@
 {
   "name": "one-database",
   "version": "1.0.0",
-  "description": "A Notion-style table database for Obsidian.",
+  "description": "A Notion-style database for Obsidian with table, line and pie views.",
   "author": "One Two Three",
   "private": true,
   "scripts": {
-    "build": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs --prod",
     "dev": "node esbuild.config.mjs --watch",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "echarts": "^5.6.0"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",

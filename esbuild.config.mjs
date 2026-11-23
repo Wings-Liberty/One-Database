@@ -12,9 +12,12 @@ const context = await esbuild.context({
   target: "es2020",
   logLevel: "info",
   sourcemap: prod ? false : "inline",
+  minify: prod,
+  legalComments: prod ? "none" : "inline",
   treeShaking: true,
   outfile: "main.js",
   platform: "browser",
+  metafile: true,
 });
 
 if (watch) {

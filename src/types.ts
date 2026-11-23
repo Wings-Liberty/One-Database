@@ -1,6 +1,6 @@
 export const VIEW_TYPE = "one-database-view";
 export const FILE_EXTENSION = "odata";
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export type ColorName =
   | "default"
@@ -93,10 +93,25 @@ export interface SortRule {
   direction: "asc" | "desc";
 }
 
+export type ViewType = "table" | "chart";
+export type ChartKind = "line" | "pie";
+export type ChartAggregation = "sum" | "average" | "count" | "min" | "max" | "median";
+export type ChartDateGrain = "day" | "month" | "year";
+
+export interface ChartConfig {
+  kind: ChartKind;
+  xPropertyId: string | null;
+  valuePropertyId: string | null;
+  aggregation: ChartAggregation;
+  groupByPropertyId: string | null;
+  dateGrain: ChartDateGrain;
+  showLegend: boolean;
+}
+
 export interface ViewConfig {
   id: string;
   name: string;
-  type: "table";
+  type: ViewType;
   filters: FilterRule[];
   conjunction: "and" | "or";
   sorts: SortRule[];
@@ -107,6 +122,7 @@ export interface ViewConfig {
   groupBy: string | null;
   collapsedGroups: string[];
   wrapText: boolean;
+  chart: ChartConfig;
 }
 
 export interface DatabaseData {
@@ -210,4 +226,24 @@ export const CALCULATION_LABELS: Record<string, string> = {
   percent_checked: "完成率",
   earliest: "最早日期",
   latest: "最晚日期",
+};
+
+export const CHART_KIND_LABELS: Record<ChartKind, string> = {
+  line: "折线图",
+  pie: "饼图",
+};
+
+export const CHART_AGGREGATION_LABELS: Record<ChartAggregation, string> = {
+  sum: "求和",
+  average: "平均值",
+  count: "计数",
+  min: "最小值",
+  max: "最大值",
+  median: "中位数",
+};
+
+export const CHART_DATE_GRAIN_LABELS: Record<ChartDateGrain, string> = {
+  day: "按天",
+  month: "按月",
+  year: "按年",
 };

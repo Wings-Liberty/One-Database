@@ -1,6 +1,10 @@
 import {
   CALCULATION_LABELS,
   COLOR_LABELS,
+  ChartAggregation,
+  ChartConfig,
+  ChartDateGrain,
+  ChartKind,
   DatabaseData,
   DatabaseProperty,
   DatabaseRow,
@@ -13,6 +17,7 @@ import {
   SelectOption,
   SortRule,
   ViewConfig,
+  ViewType,
 } from "./types";
 
 let idCounter = 0;
@@ -26,6 +31,43 @@ export function uid(prefix = "id"): string {
 
 export function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+export function defaultChartConfig(
+  properties: DatabaseProperty[],
+  kind: ChartKind = "line",
+): ChartConfig {
+  const dateProperties = properties.filter((property) =>
+    ["date", "created_time", "last_edited_time"].includes(property.type),
+  );
+  const groupable = properties.filter((property) =>
+    ["select", "status", "checkbox"].includes(property.type),
+  );
+  const categories = [
+    ...groupable,
+    ...properties.filter((property) =>
+      ["multi_select", "title", "text"].includes(property.type),
+    ),
+  ];
+  const numberProperty = properties.find((property) => property.type === "number");
+  const xProperty =
+    kind === "pie"
+      ? categories[0] || properties[0]
+      : dateProperties[0] || groupable[0] || categories[0] || properties[0];
+  const groupProperty =
+    kind === "line"
+      ? groupable.find((property) => property.id !== xProperty?.id) || null
+      : null;
+
+  return {
+    kind,
+    xPropertyId: xProperty?.id || null,
+    valuePropertyId: numberProperty?.id || null,
+    aggregation: numberProperty ? "sum" : "count",
+    groupByPropertyId: groupProperty?.id || null,
+    dateGrain: "month",
+    showLegend: true,
+  };
 }
 
 export function createView(name = "表格"): ViewConfig {
@@ -43,7 +85,19 @@ export function createView(name = "表格"): ViewConfig {
     groupBy: null,
     collapsedGroups: [],
     wrapText: false,
+    chart: defaultChartConfig([], "line"),
   };
+}
+
+export function createChartView(
+  db: DatabaseData,
+  kind: ChartKind,
+  name: string,
+): ViewConfig {
+  const view = createView(name);
+  view.type = "chart";
+  view.chart = defaultChartConfig(db.properties, kind);
+  return view;
 }
 
 export function createDatabase(title = "未命名数据库"): DatabaseData {
@@ -347,7 +401,28 @@ export function createSampleDatabase(title = "任务追踪"): DatabaseData {
   groupedView.showCalculations = true;
   groupedView.calculations = { title: "count" };
 
-  db.views.push(focusView, groupedView);
+  const lineView = createChartView(db, "line", "工时趋势");
+  lineView.chart = {
+    ...lineView.chart,
+    xPropertyId: "due",
+    valuePropertyId: "effort",
+    aggregation: "sum",
+    groupByPropertyId: "owner",
+    dateGrain: "day",
+    showLegend: true,
+  };
+
+  const pieView = createChartView(db, "pie", "状态占比");
+  pieView.chart = {
+    ...pieView.chart,
+    xPropertyId: "status",
+    valuePropertyId: null,
+    aggregation: "count",
+    groupByPropertyId: null,
+    showLegend: true,
+  };
+
+  db.views.push(focusView, groupedView, lineView, pieView);
   db.activeViewId = firstView.id;
   return db;
 }
@@ -1055,6 +1130,63 @@ function ensureUniqueId(id: unknown, fallbackPrefix: string, used: Set<string>):
   return next;
 }
 
+function normalizeChartConfig(
+  raw: unknown,
+  properties: DatabaseProperty[],
+  viewType: ViewType,
+): ChartConfig {
+  const input = (raw && typeof raw === "object" ? raw : {}) as Partial<ChartConfig>;
+  const kind: ChartKind = input.kind === "pie" ? "pie" : "line";
+  const defaults = defaultChartConfig(properties, kind);
+  const propertyIds = new Set(properties.map((property) => property.id));
+  const xPropertyId =
+    typeof input.xPropertyId === "string" && propertyIds.has(input.xPropertyId)
+      ? input.xPropertyId
+      : defaults.xPropertyId;
+  const valueProperty =
+    typeof input.valuePropertyId === "string"
+      ? properties.find(
+          (property) => property.id === input.valuePropertyId && property.type === "number",
+        )
+      : null;
+  const groupProperty =
+    typeof input.groupByPropertyId === "string"
+      ? properties.find(
+          (property) =>
+            property.id === input.groupByPropertyId &&
+            ["select", "status", "checkbox"].includes(property.type),
+        )
+      : null;
+  const aggregations: ChartAggregation[] = [
+    "sum",
+    "average",
+    "count",
+    "min",
+    "max",
+    "median",
+  ];
+  const aggregation =
+    input.aggregation && aggregations.includes(input.aggregation)
+      ? input.aggregation
+      : defaults.aggregation;
+  const dateGrains: ChartDateGrain[] = ["day", "month", "year"];
+  const dateGrain =
+    input.dateGrain && dateGrains.includes(input.dateGrain) ? input.dateGrain : "month";
+
+  return {
+    kind,
+    xPropertyId,
+    valuePropertyId: valueProperty?.id || null,
+    aggregation: valueProperty ? aggregation : "count",
+    groupByPropertyId:
+      viewType === "chart" && kind === "line" && groupProperty && groupProperty.id !== xPropertyId
+        ? groupProperty.id
+        : null,
+    dateGrain,
+    showLegend: input.showLegend !== false,
+  };
+}
+
 export function normalizeDatabase(raw: unknown): DatabaseData {
   const input = (raw && typeof raw === "object" ? raw : {}) as Partial<DatabaseData>;
   const fallback = createDatabase(
@@ -1199,11 +1331,16 @@ export function normalizeDatabase(raw: unknown): DatabaseData {
       view.calculations && typeof view.calculations === "object"
         ? { ...view.calculations }
         : {};
+    const viewType: ViewType = view.type === "chart" ? "chart" : "table";
     views.push({
       id: ensureUniqueId(view.id, "view", usedViewIds),
       name:
-        typeof view.name === "string" && view.name.trim() ? view.name.trim() : "表格",
-      type: "table",
+        typeof view.name === "string" && view.name.trim()
+          ? view.name.trim()
+          : viewType === "chart"
+            ? "图表"
+            : "表格",
+      type: viewType,
       filters: filters.map((rule) => ({
         id: typeof rule.id === "string" ? rule.id : uid("filter"),
         propertyId: rule.propertyId,
@@ -1226,6 +1363,7 @@ export function normalizeDatabase(raw: unknown): DatabaseData {
           : null,
       collapsedGroups: Array.isArray(view.collapsedGroups) ? view.collapsedGroups : [],
       wrapText: view.wrapText === true,
+      chart: normalizeChartConfig(view.chart, properties, viewType),
     });
   }
 

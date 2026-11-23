@@ -6,6 +6,7 @@ import {
   calculationLabel,
   calculationOptions,
   cellText,
+  createChartView,
   createRow,
   createView,
   csvForView,
@@ -41,7 +42,13 @@ import {
   visibleProperties,
 } from "./model";
 import {
+  CHART_AGGREGATION_LABELS,
+  CHART_DATE_GRAIN_LABELS,
+  CHART_KIND_LABELS,
   CellValue,
+  ChartAggregation,
+  ChartDateGrain,
+  ChartKind,
   DatabaseData,
   DatabaseProperty,
   DatabaseRow,
@@ -54,6 +61,13 @@ import {
   VIEW_TYPE,
   ViewConfig,
 } from "./types";
+import { ChartData, buildChartData, formatChartValue } from "./chart-model";
+import {
+  ChartInstance,
+  createChart,
+  disposeChart,
+  isDarkTheme,
+} from "./ui/chart-render";
 import {
   Popover,
   buttonEl,
@@ -131,6 +145,15 @@ export class NotionTableView extends TextFileView {
   private searchTimer: number | null = null;
   private saveTimer: number | null = null;
   private dirty = false;
+  private chartInstance: ChartInstance | null = null;
+  private chartResizeObserver: ResizeObserver | null = null;
+  private chartRenderToken = 0;
+  private themeObserver: MutationObserver | null = null;
+  private themeMode = "";
+  private chartTypeButton: HTMLButtonElement | null = null;
+  private chartXButton: HTMLButtonElement | null = null;
+  private chartYButton: HTMLButtonElement | null = null;
+  private chartGroupButton: HTMLButtonElement | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: NotionTablePlugin) {
     super(leaf);
@@ -157,14 +180,33 @@ export class NotionTableView extends TextFileView {
     await super.onOpen();
     this.contentEl.addClass("nt-view");
     this.contentEl.empty();
+    this.setupThemeObserver();
     this.renderLoading();
   }
 
   async onClose(): Promise<void> {
     closeActivePopover();
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
+    this.teardownChart();
+    this.themeObserver?.disconnect();
+    this.themeObserver = null;
     await this.flushToDisk();
     await super.onClose();
+  }
+
+  private setupThemeObserver(): void {
+    this.themeMode = isDarkTheme() ? "dark" : "light";
+    if (this.themeObserver) return;
+    this.themeObserver = new MutationObserver(() => {
+      const mode = isDarkTheme() ? "dark" : "light";
+      if (mode === this.themeMode) return;
+      this.themeMode = mode;
+      if (this.activeView?.type === "chart") this.renderChartView();
+    });
+    this.themeObserver.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
   }
 
   async onUnloadFile(file: TFile): Promise<void> {
@@ -344,6 +386,7 @@ export class NotionTableView extends TextFileView {
   private renderAll(): void {
     closeActivePopover();
     this.closeEditor(false);
+    this.teardownChart();
     this.contentEl.empty();
     this.contentEl.addClass("nt-view");
     if (!this.db) {
@@ -356,10 +399,24 @@ export class NotionTableView extends TextFileView {
     this.renderPageHeader(page);
     this.renderTabs(page);
     this.renderToolbar(page);
-    const tableArea = h("div", "nt-table-area");
-    page.append(tableArea);
-    this.tableHostEl = tableArea;
-    this.renderTable();
+    const bodyArea = h("div", "nt-table-area");
+    page.append(bodyArea);
+    this.tableHostEl = bodyArea;
+    this.renderViewBody();
+  }
+
+  private renderViewBody(): void {
+    if (!this.activeView) return;
+    if (this.activeView.type === "chart") this.renderChartView();
+    else this.renderTable();
+  }
+
+  private renderBodyPreserveScroll(): void {
+    if (this.activeView?.type === "chart") {
+      this.renderChartView();
+      return;
+    }
+    this.renderTablePreserveScroll();
   }
 
   private renderPageHeader(page: HTMLElement): void {
@@ -370,7 +427,7 @@ export class NotionTableView extends TextFileView {
     const topLine = header.createDiv({ cls: "nt-page-topline" });
     const typeLabel = topLine.createDiv({ cls: "nt-database-label" });
     typeLabel.append(iconEl("database", "nt-database-icon"));
-    typeLabel.createSpan({ text: "表格数据库" });
+    typeLabel.createSpan({ text: "数据库" });
 
     const actions = topLine.createDiv({ cls: "nt-page-actions" });
     const newButton = actions.createEl("button", {
@@ -458,7 +515,7 @@ export class NotionTableView extends TextFileView {
         cls: `nt-view-tab${active ? " is-active" : ""}`,
         attr: { type: "button", "aria-pressed": String(active) },
       });
-      tab.append(iconEl("table-2", "nt-view-tab-icon"));
+      tab.append(iconEl(this.viewIcon(view), "nt-view-tab-icon"));
       tab.createSpan({ cls: "nt-view-tab-name", text: view.name });
       tab.addEventListener("click", () => this.switchView(view.id));
       tab.addEventListener("dblclick", (event) => {
@@ -488,6 +545,11 @@ export class NotionTableView extends TextFileView {
   }
 
   private renderToolbar(page: HTMLElement): void {
+    if (this.activeView?.type === "chart") this.renderChartToolbar(page);
+    else this.renderTableToolbar(page);
+  }
+
+  private renderTableToolbar(page: HTMLElement): void {
     const view = this.activeView!;
     const toolbarWrap = page.createDiv({ cls: "nt-toolbar-wrap" });
     const toolbar = toolbarWrap.createDiv({ cls: "nt-toolbar" });
@@ -526,7 +588,7 @@ export class NotionTableView extends TextFileView {
       view.search = "";
       clearSearch.toggleClass("is-hidden", true);
       this.persist();
-      this.renderTable();
+      this.renderBodyPreserveScroll();
     });
     searchInput.addEventListener("input", () => {
       view.search = searchInput.value;
@@ -535,7 +597,7 @@ export class NotionTableView extends TextFileView {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
       this.searchTimer = window.setTimeout(() => {
         this.searchTimer = null;
-        this.renderTablePreserveScroll();
+        this.renderBodyPreserveScroll();
       }, 120);
     });
 
@@ -571,6 +633,10 @@ export class NotionTableView extends TextFileView {
   }
 
   private renderTablePreserveScroll(): void {
+    if (this.activeView?.type === "chart") {
+      this.renderChartView();
+      return;
+    }
     const top = this.tableScrollEl?.scrollTop ?? 0;
     const left = this.tableScrollEl?.scrollLeft ?? 0;
     this.renderTable();
@@ -595,7 +661,9 @@ export class NotionTableView extends TextFileView {
 
     const properties = visibleProperties(db, view);
     const tableHost = this.tableHostEl;
+    this.teardownChart();
     tableHost.empty();
+    tableHost.removeClass("nt-chart-area");
     tableHost.toggleClass("is-grouped", Boolean(view.groupBy));
 
     if (this.selectedRows.size > 0) this.renderBulkBar(tableHost);
@@ -678,6 +746,459 @@ export class NotionTableView extends TextFileView {
 
     if (view.showCalculations) this.renderCalculationFooter(table, properties, rows);
     this.updateTableCount(rows.length);
+  }
+
+  private viewIcon(view: ViewConfig): string {
+    if (view.type === "chart") {
+      return view.chart.kind === "pie" ? "chart-pie" : "chart-line";
+    }
+    return "table-2";
+  }
+
+  private teardownChart(): void {
+    this.chartRenderToken += 1;
+    this.chartResizeObserver?.disconnect();
+    this.chartResizeObserver = null;
+    if (this.chartInstance) {
+      disposeChart(this.chartInstance);
+      this.chartInstance = null;
+    }
+  }
+
+  private renderChartView(): void {
+    if (!this.db || !this.tableHostEl) return;
+    const db = this.db;
+    const view = this.activeView!;
+    const host = this.tableHostEl;
+    const rows = filteredRows(db, view);
+    this.currentRows = rows;
+    this.teardownChart();
+    host.empty();
+    host.addClass("nt-chart-area");
+    host.removeClass("is-grouped");
+    this.updateTableCount(rows.length);
+
+    const data = buildChartData(db, view, rows);
+    const card = h("div", "nt-chart-card");
+    host.append(card);
+
+    const header = card.createDiv({ cls: "nt-chart-header" });
+    const titleBlock = header.createDiv({ cls: "nt-chart-title-block" });
+    const eyebrow = titleBlock.createDiv({ cls: "nt-chart-eyebrow" });
+    eyebrow.append(
+      iconEl(view.chart.kind === "pie" ? "chart-pie" : "chart-line", "nt-chart-eyebrow-icon"),
+    );
+    eyebrow.createSpan({ text: CHART_KIND_LABELS[view.chart.kind] });
+    titleBlock.createDiv({ cls: "nt-chart-title", text: view.name });
+    const groupSuffix = data.groupLabel ? ` · 按${data.groupLabel}分组` : "";
+    titleBlock.createDiv({
+      cls: "nt-chart-subtitle",
+      text: `${data.categoryLabel} → ${data.metricLabel}${groupSuffix} · ${rows.length} 条记录`,
+    });
+
+    if (
+      !data.empty &&
+      (view.chart.aggregation === "sum" || view.chart.aggregation === "count")
+    ) {
+      const summary = header.createDiv({ cls: "nt-chart-summary" });
+      summary.createSpan({ cls: "nt-chart-summary-label", text: "合计" });
+      summary.createSpan({
+        cls: "nt-chart-summary-value",
+        text: formatChartValue(data.total, data),
+      });
+    }
+
+    if (data.empty) {
+      this.renderChartEmpty(card, data);
+      return;
+    }
+
+    const canvas = card.createDiv({ cls: "nt-chart-canvas" });
+    const token = this.chartRenderToken;
+    let initialized = false;
+    const initializeChart = () => {
+      if (
+        initialized ||
+        token !== this.chartRenderToken ||
+        !canvas.isConnected
+      ) {
+        return;
+      }
+      initialized = true;
+      try {
+        this.chartInstance = createChart(canvas, data, isDarkTheme());
+        this.chartResizeObserver = new ResizeObserver(() => {
+          this.chartInstance?.resize();
+        });
+        this.chartResizeObserver.observe(canvas);
+        this.chartInstance.resize();
+      } catch (error) {
+        console.error("One Database: could not render chart", error);
+        canvas.empty();
+        canvas.createDiv({
+          cls: "nt-chart-render-error",
+          text: "图表渲染失败，请尝试切换图表类型或重新打开视图。",
+        });
+      }
+    };
+    window.requestAnimationFrame(initializeChart);
+    // requestAnimationFrame is paused while the window is hidden; the timeout
+    // still lets the chart initialize for background windows and popouts.
+    window.setTimeout(initializeChart, 80);
+  }
+
+  private renderChartEmpty(card: HTMLElement, data: ChartData): void {
+    card.addClass("is-empty");
+    const empty = card.createDiv({ cls: "nt-chart-empty" });
+    const icon = empty.createDiv({ cls: "nt-chart-empty-icon" });
+    icon.append(iconEl(data.kind === "pie" ? "chart-pie" : "chart-line", "nt-icon"));
+    empty.createEl("strong", { text: data.message });
+    empty.createEl("p", {
+      text:
+        data.rowCount === 0
+          ? "当前筛选条件下没有记录，调整筛选或搜索后再试。"
+          : "选择适合的 X 轴和数值属性，即可生成图表。",
+    });
+    const actions = empty.createDiv({ cls: "nt-chart-empty-actions" });
+    const xButton = actions.createEl("button", {
+      cls: "nt-button",
+      text: "选择 X 轴",
+    });
+    xButton.addEventListener("click", () => this.openChartXAxisMenu(xButton));
+    const yButton = actions.createEl("button", {
+      cls: "nt-button nt-button-primary",
+      text: "设置 Y 轴",
+    });
+    yButton.addEventListener("click", () => this.openChartYAxisMenu(yButton));
+  }
+
+  private renderChartToolbar(page: HTMLElement): void {
+    const view = this.activeView!;
+    const chart = view.chart;
+    const toolbarWrap = page.createDiv({ cls: "nt-toolbar-wrap" });
+    const toolbar = toolbarWrap.createDiv({ cls: "nt-toolbar nt-chart-toolbar" });
+    const left = toolbar.createDiv({ cls: "nt-toolbar-left" });
+
+    const typeIcon = chart.kind === "pie" ? "chart-pie" : "chart-line";
+    this.chartTypeButton = this.createToolbarButton(
+      left,
+      typeIcon,
+      CHART_KIND_LABELS[chart.kind],
+    );
+    this.chartTypeButton.addClass("nt-chart-type-button");
+    this.chartTypeButton.addEventListener("click", () =>
+      this.openChartTypeMenu(this.chartTypeButton!),
+    );
+
+    const xProperty = chart.xPropertyId ? propertyById(this.db!, chart.xPropertyId) : undefined;
+    this.chartXButton = this.createToolbarButton(
+      left,
+      "arrow-right",
+      `X 轴 · ${xProperty?.name || "未选择"}`,
+    );
+    this.chartXButton.addEventListener("click", () =>
+      this.openChartXAxisMenu(this.chartXButton!),
+    );
+
+    const valueProperty =
+      chart.valuePropertyId && chart.aggregation !== "count"
+        ? propertyById(this.db!, chart.valuePropertyId)
+        : undefined;
+    const yLabel = valueProperty?.name || "记录数";
+    this.chartYButton = this.createToolbarButton(left, "sigma", `Y 轴 · ${yLabel}`);
+    this.chartYButton.title = `Y 轴 · ${yLabel} · ${CHART_AGGREGATION_LABELS[chart.aggregation]}`;
+    this.chartYButton.addEventListener("click", () =>
+      this.openChartYAxisMenu(this.chartYButton!),
+    );
+
+    if (chart.kind === "line") {
+      const groupProperty =
+        chart.groupByPropertyId ? propertyById(this.db!, chart.groupByPropertyId) : undefined;
+      this.chartGroupButton = this.createToolbarButton(
+        left,
+        "layers",
+        groupProperty ? `分组 · ${groupProperty.name}` : "分组",
+      );
+      this.chartGroupButton.toggleClass("is-active", Boolean(groupProperty));
+      this.chartGroupButton.addEventListener("click", () =>
+        this.openChartGroupMenu(this.chartGroupButton!),
+      );
+    }
+
+    this.filterButton = this.createToolbarButton(left, "list-filter", "筛选");
+    this.filterButton.toggleClass("is-active", view.filters.length > 0);
+    this.updateBadge(this.filterButton, view.filters.length);
+    this.filterButton.addEventListener("click", () => this.openFilterPanel(this.filterButton!));
+
+    const right = toolbar.createDiv({ cls: "nt-toolbar-right" });
+    const search = right.createDiv({ cls: "nt-search-box" });
+    search.append(iconEl("search", "nt-search-icon"));
+    const searchInput = search.createEl("input", {
+      cls: "nt-search-input",
+      type: "search",
+      value: view.search,
+      attr: { placeholder: "搜索…", "aria-label": "搜索记录" },
+    });
+    const clearSearch = search.createEl("button", {
+      cls: `nt-search-clear${view.search ? "" : " is-hidden"}`,
+      attr: { type: "button", "aria-label": "清除搜索" },
+    });
+    clearSearch.append(iconEl("x", "nt-icon"));
+    clearSearch.addEventListener("click", () => {
+      searchInput.value = "";
+      view.search = "";
+      clearSearch.toggleClass("is-hidden", true);
+      this.persist();
+      this.renderChartView();
+    });
+    searchInput.addEventListener("input", () => {
+      view.search = searchInput.value;
+      clearSearch.toggleClass("is-hidden", !view.search);
+      this.persist();
+      if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
+      this.searchTimer = window.setTimeout(() => {
+        this.searchTimer = null;
+        if (this.activeView?.type === "chart") this.renderChartView();
+      }, 120);
+    });
+
+    this.tableCountEl = right.createDiv({ cls: "nt-toolbar-count" });
+
+    const moreButton = right.createEl("button", {
+      cls: "nt-icon-button",
+      attr: { type: "button", "aria-label": "图表选项", title: "图表选项" },
+    });
+    moreButton.append(iconEl("more-horizontal", "nt-icon"));
+    moreButton.addEventListener("click", () => this.openChartViewOptionsMenu(moreButton));
+  }
+
+  private openChartTypeMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "图表类型" });
+      for (const kind of ["line", "pie"] as ChartKind[]) {
+        this.menuItem(
+          content,
+          kind === "pie" ? "chart-pie" : "chart-line",
+          CHART_KIND_LABELS[kind],
+          () => {
+            view.chart.kind = kind;
+            if (kind === "pie") view.chart.groupByPropertyId = null;
+            this.persist();
+            popover.close();
+            this.renderAll();
+          },
+          { checked: view.chart.kind === kind },
+        );
+      }
+      content.createDiv({
+        cls: "nt-menu-note",
+        text: "折线图适合展示趋势；饼图适合展示分类占比。",
+      });
+    }, { width: 225 });
+  }
+
+  private chartXProperties(): DatabaseProperty[] {
+    if (!this.db) return [];
+    return this.db.properties;
+  }
+
+  private openChartXAxisMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    const chart = view.chart;
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "X 轴 · 分类" });
+      for (const property of this.chartXProperties()) {
+        this.menuItem(
+          content,
+          this.propertyIcon(property),
+          property.name,
+          () => {
+            chart.xPropertyId = property.id;
+            if (chart.groupByPropertyId === property.id) chart.groupByPropertyId = null;
+            this.persist();
+            popover.close();
+            this.renderAll();
+          },
+          { checked: chart.xPropertyId === property.id },
+        );
+      }
+      const xProperty = chart.xPropertyId ? propertyById(this.db!, chart.xPropertyId) : undefined;
+      if (
+        xProperty &&
+        ["date", "created_time", "last_edited_time"].includes(xProperty.type)
+      ) {
+        content.createDiv({ cls: "nt-menu-divider" });
+        content.createDiv({ cls: "nt-menu-heading", text: "日期粒度" });
+        for (const grain of ["day", "month", "year"] as ChartDateGrain[]) {
+          this.menuItem(
+            content,
+            "calendar-days",
+            CHART_DATE_GRAIN_LABELS[grain],
+            () => {
+              chart.dateGrain = grain;
+              this.persist();
+              popover.close();
+              this.renderAll();
+            },
+            { checked: chart.dateGrain === grain },
+          );
+        }
+      }
+    }, { width: 260 });
+  }
+
+  private openChartYAxisMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    const chart = view.chart;
+    const numericProperties = this.db.properties.filter((property) => property.type === "number");
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "Y 轴 · 数值" });
+      this.menuItem(
+        content,
+        "hash",
+        "记录数（计数）",
+        () => {
+          chart.valuePropertyId = null;
+          chart.aggregation = "count";
+          this.persist();
+          popover.close();
+          this.renderAll();
+        },
+        { checked: chart.aggregation === "count" || !chart.valuePropertyId },
+      );
+      for (const property of numericProperties) {
+        this.menuItem(
+          content,
+          "hash",
+          property.name,
+          () => {
+            chart.valuePropertyId = property.id;
+            if (chart.aggregation === "count") chart.aggregation = "sum";
+            this.persist();
+            popover.close();
+            this.renderAll();
+          },
+          { checked: chart.valuePropertyId === property.id && chart.aggregation !== "count" },
+        );
+      }
+      if (numericProperties.length === 0) {
+        content.createDiv({ cls: "nt-menu-note", text: "还没有数字属性，当前按记录数计数。" });
+      } else if (chart.valuePropertyId && chart.aggregation !== "count") {
+        content.createDiv({ cls: "nt-menu-divider" });
+        content.createDiv({ cls: "nt-menu-heading", text: "聚合方式" });
+        for (const aggregation of ["sum", "average", "min", "max", "median"] as ChartAggregation[]) {
+          this.menuItem(
+            content,
+            "sigma",
+            CHART_AGGREGATION_LABELS[aggregation],
+            () => {
+              chart.aggregation = aggregation;
+              this.persist();
+              popover.close();
+              this.renderAll();
+            },
+            { checked: chart.aggregation === aggregation },
+          );
+        }
+      }
+    }, { width: 255 });
+  }
+
+  private openChartGroupMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    const chart = view.chart;
+    const candidates = this.db.properties.filter((property) =>
+      ["select", "status", "checkbox"].includes(property.type),
+    );
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "按属性拆分线条" });
+      this.menuItem(
+        content,
+        "ban",
+        "不分组",
+        () => {
+          chart.groupByPropertyId = null;
+          this.persist();
+          popover.close();
+          this.renderAll();
+        },
+        { checked: !chart.groupByPropertyId },
+      );
+      for (const property of candidates) {
+        this.menuItem(
+          content,
+          this.propertyIcon(property),
+          property.name,
+          () => {
+            chart.groupByPropertyId = property.id;
+            this.persist();
+            popover.close();
+            this.renderAll();
+          },
+          { checked: chart.groupByPropertyId === property.id },
+        );
+      }
+      if (candidates.length === 0) {
+        content.createDiv({
+          cls: "nt-menu-note",
+          text: "添加「单选」「状态」或「复选框」属性后即可分组。",
+        });
+      }
+    }, { width: 235 });
+  }
+
+  private openChartViewOptionsMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "图表选项" });
+      this.menuItem(
+        content,
+        "list",
+        "显示图例",
+        () => {
+          view.chart.showLegend = !view.chart.showLegend;
+          this.persist();
+          popover.close();
+          this.renderChartView();
+        },
+        { checked: view.chart.showLegend },
+      );
+      this.menuItem(content, "table-2", "改为表格视图", () => {
+        view.type = "table";
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      content.createDiv({ cls: "nt-menu-divider" });
+      this.menuItem(content, "download", "导出原始数据为 CSV", () => {
+        popover.close();
+        this.exportCsv();
+      });
+      this.menuItem(content, "eraser", "清除筛选与搜索", () => {
+        view.filters = [];
+        view.search = "";
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      content.createDiv({ cls: "nt-menu-divider" });
+      this.menuItem(
+        content,
+        "trash-2",
+        "删除全部记录",
+        () => {
+          popover.close();
+          void this.deleteAllRows();
+        },
+        { danger: true },
+      );
+    }, { width: 245 });
   }
 
   private renderBulkBar(parent: HTMLElement): void {
@@ -1292,6 +1813,11 @@ export class NotionTableView extends TextFileView {
     const row = createRow(this.db);
     this.db.rows.push(row);
     this.persist();
+    if (this.activeView?.type === "chart") {
+      this.renderChartView();
+      notify("已添加一条记录，图表已更新");
+      return;
+    }
     this.renderTablePreserveScroll();
     window.requestAnimationFrame(() => {
       const title = titleProperty(this.db!);
@@ -1578,11 +2104,39 @@ export class NotionTableView extends TextFileView {
         popover.close();
         this.renderAll();
       });
+      content.createDiv({ cls: "nt-menu-divider" });
+      this.menuItem(content, "chart-line", "折线图", () => {
+        const view = createChartView(
+          this.db!,
+          "line",
+          this.uniqueViewName("折线图"),
+        );
+        this.db!.views.push(view);
+        this.db!.activeViewId = view.id;
+        this.selectedRows.clear();
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      this.menuItem(content, "chart-pie", "饼图", () => {
+        const view = createChartView(
+          this.db!,
+          "pie",
+          this.uniqueViewName("饼图"),
+        );
+        this.db!.views.push(view);
+        this.db!.activeViewId = view.id;
+        this.selectedRows.clear();
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      content.createDiv({ cls: "nt-menu-divider" });
       this.menuItem(content, "copy", "复制当前视图", () => {
         popover.close();
         this.duplicateActiveView();
       });
-      content.createDiv({ cls: "nt-menu-note", text: "本插件专注于表格视图。" });
+      content.createDiv({ cls: "nt-menu-note", text: "支持表格、折线图和饼图视图。" });
     }, { width: 230 });
   }
 
@@ -2063,6 +2617,14 @@ export class NotionTableView extends TextFileView {
       view.hiddenProperties = view.hiddenProperties.filter((id) => id !== property.id);
       delete view.calculations[property.id];
       if (view.groupBy === property.id) view.groupBy = null;
+      if (view.chart.xPropertyId === property.id) view.chart.xPropertyId = null;
+      if (view.chart.valuePropertyId === property.id) {
+        view.chart.valuePropertyId = null;
+        view.chart.aggregation = "count";
+      }
+      if (view.chart.groupByPropertyId === property.id) {
+        view.chart.groupByPropertyId = null;
+      }
     }
     this.persist();
     this.renderTablePreserveScroll();

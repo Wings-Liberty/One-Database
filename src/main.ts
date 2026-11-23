@@ -27,7 +27,7 @@ export default class NotionTablePlugin extends Plugin {
 
     this.addCommand({
       id: "export-current-view-csv",
-      name: "导出当前表格视图为 CSV",
+      name: "导出当前视图为 CSV",
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(NotionTableView);
         if (!view) return false;

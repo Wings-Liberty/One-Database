@@ -11,6 +11,7 @@ import {
   DateValue,
   FilterOperator,
   FilterRule,
+  NumberFormat,
   PropertyType,
   SCHEMA_VERSION,
   SELECT_COLORS,
@@ -457,6 +458,12 @@ export function getCell(row: DatabaseRow, property: DatabaseProperty): unknown {
   return getRawCell(row, property) ?? null;
 }
 
+const rowRevisions = new WeakMap<DatabaseRow, number>();
+
+function rowRevision(row: DatabaseRow): number {
+  return rowRevisions.get(row) ?? 0;
+}
+
 export function isCellEmpty(value: unknown): boolean {
   if (value === null || value === undefined) return true;
   if (typeof value === "string") return value.trim().length === 0;
@@ -480,6 +487,7 @@ export function setCell(
     row.cells[property.id] = value as DatabaseRow["cells"][string];
   }
   row.updatedAt = Date.now();
+  rowRevisions.set(row, rowRevision(row) + 1);
 }
 
 export function optionById(property: DatabaseProperty, id: unknown): SelectOption | undefined {
@@ -581,6 +589,22 @@ export function isDateOverdue(value: DateValue, done: boolean): boolean {
   return key < today.getTime();
 }
 
+const numberFormatters = new Map<string, Intl.NumberFormat>();
+
+function numberFormatter(format: NumberFormat): Intl.NumberFormat {
+  let formatter = numberFormatters.get(format);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(
+      "zh-CN",
+      format === "currency"
+        ? { style: "currency", currency: "CNY", maximumFractionDigits: 2 }
+        : { maximumFractionDigits: format === "percent" ? 2 : 6 },
+    );
+    numberFormatters.set(format, formatter);
+  }
+  return formatter;
+}
+
 export function formatNumber(value: unknown, property: DatabaseProperty): string {
   if (value === null || value === undefined || value === "") return "";
   const num = typeof value === "number" ? value : Number(value);
@@ -588,19 +612,9 @@ export function formatNumber(value: unknown, property: DatabaseProperty): string
   const format = property.numberFormat || "number";
   try {
     if (format === "percent") {
-      return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(num)}%`;
+      return `${numberFormatter(format).format(num)}%`;
     }
-    if (format === "currency") {
-      return new Intl.NumberFormat("zh-CN", {
-        style: "currency",
-        currency: "CNY",
-        maximumFractionDigits: 2,
-      }).format(num);
-    }
-    if (format === "comma") {
-      return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 }).format(num);
-    }
-    return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 }).format(num);
+    return numberFormatter(format).format(num);
   } catch {
     return String(num);
   }
@@ -632,10 +646,40 @@ export function cellText(row: DatabaseRow, property: DatabaseProperty): string {
   }
 }
 
-export function rowSearchText(row: DatabaseRow, db: DatabaseData): string {
+const searchTextCache = new WeakMap<
+  DatabaseRow,
+  { updatedAt: number; revision: number; signature: string; text: string }
+>();
+
+function searchTextSignature(db: DatabaseData): string {
+  let signature = String(new Date().getFullYear());
+  for (const property of db.properties) {
+    signature += `\u0001${property.id}\u0002${property.type}\u0002${property.numberFormat || ""}`;
+    for (const option of property.options || []) {
+      signature += `\u0002${option.id}\u0003${option.name}\u0003${option.color}`;
+    }
+    signature += "\u0004";
+  }
+  return signature;
+}
+
+export function rowSearchText(row: DatabaseRow, db: DatabaseData, signature?: string): string {
+  const cacheKey = signature ?? searchTextSignature(db);
+  const cached = searchTextCache.get(row);
+  const revision = rowRevision(row);
+  if (
+    cached &&
+    cached.updatedAt === row.updatedAt &&
+    cached.revision === revision &&
+    cached.signature === cacheKey
+  ) {
+    return cached.text;
+  }
   const values = db.properties.map((property) => cellText(row, property));
   values.push(row.content || "");
-  return values.join(" ").toLocaleLowerCase();
+  const text = values.join(" ").toLocaleLowerCase();
+  searchTextCache.set(row, { updatedAt: row.updatedAt, revision, signature: cacheKey, text });
+  return text;
 }
 
 export interface FilterOperatorMeta {
@@ -865,70 +909,76 @@ export function matchesFilter(
 
 export function filteredRows(db: DatabaseData, view: ViewConfig): DatabaseRow[] {
   const search = view.search.trim().toLocaleLowerCase();
+  const searchSignature = search ? searchTextSignature(db) : "";
+  const filterChecks = view.filters.map((rule) => ({
+    rule,
+    property: propertyById(db, rule.propertyId),
+  }));
+
   let rows = db.rows.filter((row) => {
-    if (search && !rowSearchText(row, db).includes(search)) return false;
-    if (view.filters.length === 0) return true;
-    const checks = view.filters.map((rule) => {
-      const property = propertyById(db, rule.propertyId);
-      if (!property) return true;
-      return matchesFilter(row, property, rule);
-    });
+    if (search && !rowSearchText(row, db, searchSignature).includes(search)) return false;
+    if (filterChecks.length === 0) return true;
+    const checks = filterChecks.map(({ rule, property }) =>
+      property ? matchesFilter(row, property, rule) : true,
+    );
     return view.conjunction === "or" ? checks.some(Boolean) : checks.every(Boolean);
   });
 
   if (view.sorts.length > 0) {
     const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
-    rows = rows.slice().sort((a, b) => {
-      for (const sort of view.sorts) {
-        const property = propertyById(db, sort.propertyId);
-        if (!property) continue;
-        const aEmpty = isCellEmpty(getCell(a, property));
-        const bEmpty = isCellEmpty(getCell(b, property));
-        if (aEmpty || bEmpty) {
-          if (aEmpty && bEmpty) continue;
-          // Empty values always sit at the bottom, regardless of direction.
-          return aEmpty ? 1 : -1;
+    const sortSpecs = view.sorts
+      .map((sort) => ({ sort, property: propertyById(db, sort.propertyId) }))
+      .filter((spec): spec is { sort: SortRule; property: DatabaseProperty } => Boolean(spec.property));
+    if (sortSpecs.length > 0) {
+      const keyed = rows.map((row) => ({
+        row,
+        keys: sortSpecs.map(({ property }) => rowSortKey(row, property)),
+      }));
+      keyed.sort((a, b) => {
+        for (let index = 0; index < sortSpecs.length; index += 1) {
+          const aKey = a.keys[index];
+          const bKey = b.keys[index];
+          const aEmpty = aKey === null;
+          const bEmpty = bKey === null;
+          if (aEmpty || bEmpty) {
+            if (aEmpty && bEmpty) continue;
+            // Empty values always sit at the bottom, regardless of direction.
+            return aEmpty ? 1 : -1;
+          }
+          const result =
+            typeof aKey === "number" && typeof bKey === "number"
+              ? aKey - bKey
+              : collator.compare(String(aKey), String(bKey));
+          if (result !== 0) {
+            return sortSpecs[index].sort.direction === "desc" ? -result : result;
+          }
         }
-        const result = compareRowValues(a, b, property, collator);
-        if (result !== 0) return sort.direction === "desc" ? -result : result;
-      }
-      return 0;
-    });
+        return 0;
+      });
+      rows = keyed.map((entry) => entry.row);
+    }
   }
 
   return rows;
 }
 
-function compareRowValues(
-  a: DatabaseRow,
-  b: DatabaseRow,
-  property: DatabaseProperty,
-  collator: Intl.Collator,
-): number {
-  const aValue = getCell(a, property);
-  const bValue = getCell(b, property);
-
-  if (property.type === "number") {
-    return Number(aValue) - Number(bValue);
-  }
-  if (property.type === "checkbox") {
-    return Number(Boolean(aValue)) - Number(Boolean(bValue));
-  }
-  if (property.type === "date") {
-    return (timeValueOfDate(aValue as DateValue) || 0) - (timeValueOfDate(bValue as DateValue) || 0);
-  }
+function rowSortKey(row: DatabaseRow, property: DatabaseProperty): string | number | null {
+  const value = getCell(row, property);
+  if (isCellEmpty(value)) return null;
+  if (property.type === "number") return Number(value);
+  if (property.type === "checkbox") return Number(Boolean(value));
+  if (property.type === "date") return timeValueOfDate(value as DateValue) || 0;
   if (property.type === "created_time" || property.type === "last_edited_time") {
-    return Number(aValue) - Number(bValue);
+    return Number(value);
   }
   if (property.type === "select" || property.type === "status") {
-    return collator.compare(optionName(property, aValue), optionName(property, bValue));
+    return optionName(property, value);
   }
   if (property.type === "multi_select") {
-    const textA = (aValue as string[]).map((id) => optionName(property, id)).join(", ");
-    const textB = (bValue as string[]).map((id) => optionName(property, id)).join(", ");
-    return collator.compare(textA, textB);
+    const ids = Array.isArray(value) ? value : [];
+    return ids.map((id) => optionName(property, id)).join(", ");
   }
-  return collator.compare(String(aValue ?? ""), String(bValue ?? ""));
+  return String(value ?? "");
 }
 
 export interface RowGroup {

@@ -32,6 +32,7 @@ import {
   pad2,
   parseDatabaseJson,
   propertyById,
+  RowGroup,
   serializeDatabase,
   setCell,
   titleProperty,
@@ -114,6 +115,17 @@ const EMOJI_CHOICES = [
   "🪐",
 ];
 
+const TABLE_ROW_CHUNK = 80;
+
+type TableRenderEntry =
+  | { kind: "group"; group: RowGroup; collapsed: boolean }
+  | { kind: "row"; row: DatabaseRow };
+
+interface TableRenderOptions {
+  afterRender?: () => void;
+  reuseRows?: boolean;
+}
+
 interface ActiveEditor {
   td: HTMLElement;
   row: DatabaseRow;
@@ -127,7 +139,7 @@ export class NotionTableView extends TextFileView {
   plugin: NotionTablePlugin;
   private db: DatabaseData | null = null;
   private loadError = "";
-  private lastSerialized = "";
+  private serializedCache: string | null = null;
   private rootEl: HTMLElement | null = null;
   private tableHostEl: HTMLElement | null = null;
   private tableScrollEl: HTMLElement | null = null;
@@ -141,6 +153,18 @@ export class NotionTableView extends TextFileView {
   private iconButton: HTMLButtonElement | null = null;
   private activeEditor: ActiveEditor | null = null;
   private currentRows: DatabaseRow[] = [];
+  private rowsById = new Map<string, DatabaseRow>();
+  private propertiesById = new Map<string, DatabaseProperty>();
+  private rowDoneCache = new Map<string, boolean>();
+  private rowEls = new Map<string, HTMLTableRowElement>();
+  private tableColEls = new Map<string, HTMLTableColElement>();
+  private rovingTabEl: HTMLElement | null = null;
+  private poolSignature: string | null = null;
+  private calcValueEls = new Map<string, HTMLElement>();
+  private bulkBarEl: HTMLElement | null = null;
+  private bulkCountEl: HTMLElement | null = null;
+  private selectAllEl: HTMLInputElement | null = null;
+  private tableRenderToken = 0;
   private selectedRows = new Set<string>();
   private searchTimer: number | null = null;
   private saveTimer: number | null = null;
@@ -185,6 +209,7 @@ export class NotionTableView extends TextFileView {
   }
 
   async onClose(): Promise<void> {
+    this.tableRenderToken += 1;
     closeActivePopover();
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     this.teardownChart();
@@ -225,9 +250,8 @@ export class NotionTableView extends TextFileView {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    const serialized = serializeDatabase(this.db);
+    const serialized = this.serializedData();
     this.data = serialized;
-    this.lastSerialized = serialized;
     try {
       await this.app.vault.modify(this.file, serialized);
       this.dirty = false;
@@ -236,19 +260,35 @@ export class NotionTableView extends TextFileView {
     }
   }
 
+  private serializedData(): string {
+    if (!this.db) return this.data || "";
+    if (this.serializedCache === null) {
+      this.serializedCache = serializeDatabase(this.db);
+    }
+    return this.serializedCache;
+  }
+
   clear(): void {
     this.db = null;
     this.loadError = "";
     this.data = "";
-    this.lastSerialized = "";
+    this.serializedCache = null;
     this.dirty = false;
     this.selectedRows.clear();
     this.currentRows = [];
+    this.rowsById.clear();
+    this.propertiesById.clear();
+    this.rowDoneCache.clear();
+    this.rowEls.clear();
+    this.rovingTabEl = null;
+    this.poolSignature = null;
+    this.tableColEls.clear();
+    this.calcValueEls.clear();
   }
 
   setViewData(data: string, _clear: boolean): void {
     this.data = data;
-    this.lastSerialized = data;
+    this.serializedCache = null;
     this.dirty = false;
     try {
       this.db = parseDatabaseJson(data);
@@ -264,10 +304,8 @@ export class NotionTableView extends TextFileView {
 
   getViewData(): string {
     if (!this.db) return this.data || "";
-    const serialized = serializeDatabase(this.db);
-    this.lastSerialized = serialized;
-    this.data = serialized;
-    return serialized;
+    this.data = this.serializedData();
+    return this.data;
   }
 
   private get activeView(): ViewConfig | null {
@@ -277,9 +315,8 @@ export class NotionTableView extends TextFileView {
   private persist(): void {
     if (!this.db) return;
     this.dirty = true;
+    this.serializedCache = null;
     touchDatabase(this.db);
-    this.data = serializeDatabase(this.db);
-    this.lastSerialized = this.data;
     if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
@@ -291,12 +328,11 @@ export class NotionTableView extends TextFileView {
   private persistNow(): void {
     if (!this.db) return;
     this.dirty = true;
+    this.serializedCache = null;
     if (this.saveTimer !== null) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.data = serializeDatabase(this.db);
-    this.lastSerialized = this.data;
     this.requestSave();
     this.refreshTabTitle();
   }
@@ -351,8 +387,7 @@ export class NotionTableView extends TextFileView {
         const parsed = parseDatabaseJson(textarea.value);
         this.db = parsed;
         this.loadError = "";
-        this.data = serializeDatabase(parsed);
-        this.lastSerialized = this.data;
+        this.serializedCache = null;
         this.requestSave();
         this.renderAll();
         notify("数据库已修复并重新加载");
@@ -632,34 +667,72 @@ export class NotionTableView extends TextFileView {
     button.append(badge);
   }
 
-  private renderTablePreserveScroll(): void {
+  private renderTablePreserveScroll(afterRender?: () => void, reuseRows = true): void {
     if (this.activeView?.type === "chart") {
       this.renderChartView();
+      afterRender?.();
       return;
     }
     const top = this.tableScrollEl?.scrollTop ?? 0;
     const left = this.tableScrollEl?.scrollLeft ?? 0;
-    this.renderTable();
-    window.requestAnimationFrame(() => {
-      if (this.tableScrollEl) {
-        this.tableScrollEl.scrollTop = top;
-        this.tableScrollEl.scrollLeft = left;
-      }
+    this.renderTable({
+      reuseRows,
+      afterRender: () => {
+        window.requestAnimationFrame(() => {
+          if (this.tableScrollEl) {
+            this.tableScrollEl.scrollTop = top;
+            this.tableScrollEl.scrollLeft = left;
+          }
+          afterRender?.();
+        });
+      },
     });
   }
 
-  private renderTable(): void {
-    if (!this.db || !this.tableHostEl) return;
+  private tableCellSignature(properties: DatabaseProperty[]): string {
+    return properties
+      .map(
+        (property) =>
+          `${property.id}\u0001${property.type}\u0001${property.numberFormat || ""}\u0001${(
+            property.options || []
+          )
+            .map((option) => `${option.id}\u0002${option.name}\u0002${option.color}`)
+            .join("\u0003")}`,
+      )
+      .join("\u0004");
+  }
+
+  private renderTable(options: TableRenderOptions = {}): void {
+    if (!this.db || !this.tableHostEl) {
+      options.afterRender?.();
+      return;
+    }
+    const token = ++this.tableRenderToken;
     const db = this.db;
     const view = this.activeView!;
+    this.rowsById = new Map(db.rows.map((row) => [row.id, row]));
+    this.propertiesById = new Map(db.properties.map((property) => [property.id, property]));
+    this.rowDoneCache.clear();
     const rows = filteredRows(db, view);
     this.currentRows = rows;
 
     for (const id of Array.from(this.selectedRows)) {
-      if (!db.rows.some((row) => row.id === id)) this.selectedRows.delete(id);
+      if (!this.rowsById.has(id)) this.selectedRows.delete(id);
     }
 
     const properties = visibleProperties(db, view);
+    const signature = this.tableCellSignature(properties);
+    const previousRows =
+      options.reuseRows && this.poolSignature === signature ? new Map(this.rowEls) : null;
+    this.rowEls.clear();
+    this.poolSignature = signature;
+    this.rovingTabEl = null;
+    this.tableColEls.clear();
+    this.calcValueEls.clear();
+    this.bulkBarEl = null;
+    this.bulkCountEl = null;
+    this.selectAllEl = null;
+
     const tableHost = this.tableHostEl;
     this.teardownChart();
     tableHost.empty();
@@ -686,53 +759,37 @@ export class NotionTableView extends TextFileView {
     const colgroup = table.createEl("colgroup");
     colgroup.createEl("col", { attr: { style: `width:${gutterWidth}px` } });
     for (const property of properties) {
-      colgroup.createEl("col", {
+      const col = colgroup.createEl("col", {
         attr: { style: `width:${property.width || 170}px` },
       });
+      this.tableColEls.set(property.id, col);
     }
     colgroup.createEl("col", { attr: { style: `width:${addColumnWidth}px` } });
 
     this.renderTableHead(table, properties, rows);
     const tbody = table.createEl("tbody");
+    this.bindTableEvents(tbody);
     const groups = view.groupBy ? groupRows(db, view, rows) : null;
 
+    const entries: TableRenderEntry[] = [];
     if (groups && groups.length > 0) {
       for (const group of groups) {
         const collapsed = view.collapsedGroups.includes(group.key);
-        const groupRow = tbody.createEl("tr", { cls: "nt-group-row" });
-        const groupCell = groupRow.createEl("td", {
-          attr: { colspan: String(properties.length + 2) },
-        });
-        const groupButton = groupCell.createDiv({ cls: "nt-group-header" });
-        groupButton.append(
-          iconEl(collapsed ? "chevron-right" : "chevron-down", "nt-group-chevron"),
-        );
-        const pill = groupButton.createSpan({
-          cls: `nt-pill ${group.color ? `nt-color-${group.color}` : "nt-color-default"}`,
-        });
-        if (group.color) pill.createSpan({ cls: "nt-option-dot" });
-        pill.createSpan({ text: group.label });
-        groupButton.createSpan({ cls: "nt-group-count", text: String(group.rows.length) });
-        groupButton.addEventListener("click", () => {
-          const index = view.collapsedGroups.indexOf(group.key);
-          if (index >= 0) view.collapsedGroups.splice(index, 1);
-          else view.collapsedGroups.push(group.key);
-          this.persist();
-          this.renderTablePreserveScroll();
-        });
+        entries.push({ kind: "group", group, collapsed });
         if (!collapsed) {
-          for (const row of group.rows) this.appendDataRow(tbody, row, properties);
+          for (const row of group.rows) entries.push({ kind: "row", row });
         }
       }
     } else {
-      for (const row of rows) this.appendDataRow(tbody, row, properties);
+      for (const row of rows) entries.push({ kind: "row", row });
     }
 
     if (rows.length === 0) this.appendEmptyState(tbody, properties.length + 2);
 
+    let addRowEl: HTMLTableRowElement | null = null;
     if (rows.length > 0) {
-      const addRow = tbody.createEl("tr", { cls: "nt-add-row-row" });
-      const cell = addRow.createEl("td", {
+      addRowEl = tbody.createEl("tr", { cls: "nt-add-row-row" });
+      const cell = addRowEl.createEl("td", {
         attr: { colspan: String(properties.length + 2) },
       });
       const addButton = cell.createEl("button", {
@@ -746,6 +803,72 @@ export class NotionTableView extends TextFileView {
 
     if (view.showCalculations) this.renderCalculationFooter(table, properties, rows);
     this.updateTableCount(rows.length);
+
+    if (entries.length > TABLE_ROW_CHUNK) {
+      const total = db.rows.length;
+      this.tableCountEl?.setText(
+        rows.length === total
+          ? `${rows.length} 条记录 · 渲染中…`
+          : `${rows.length} / ${total} 条记录 · 渲染中…`,
+      );
+    }
+
+    let cursor = 0;
+    const renderChunk = () => {
+      if (token !== this.tableRenderToken) return;
+      const fragment = document.createDocumentFragment();
+      const end = Math.min(entries.length, cursor + TABLE_ROW_CHUNK);
+      for (; cursor < end; cursor += 1) {
+        const entry = entries[cursor];
+        if (entry.kind === "group") {
+          this.appendGroupRow(fragment, entry.group, entry.collapsed, properties, view);
+        } else {
+          this.appendDataRow(fragment, entry.row, properties, previousRows);
+        }
+      }
+      if (fragment.childNodes.length > 0) {
+        if (addRowEl) tbody.insertBefore(fragment, addRowEl);
+        else tbody.append(fragment);
+      }
+      if (cursor < entries.length) {
+        window.requestAnimationFrame(renderChunk);
+        return;
+      }
+      this.ensureRovingTabStop();
+      this.updateTableCount(rows.length);
+      options.afterRender?.();
+    };
+    renderChunk();
+  }
+
+  private appendGroupRow(
+    container: DocumentFragment | HTMLTableSectionElement,
+    group: RowGroup,
+    collapsed: boolean,
+    properties: DatabaseProperty[],
+    view: ViewConfig,
+  ): void {
+    const groupRow = container.createEl("tr", { cls: "nt-group-row" });
+    const groupCell = groupRow.createEl("td", {
+      attr: { colspan: String(properties.length + 2) },
+    });
+    const groupButton = groupCell.createDiv({ cls: "nt-group-header" });
+    groupButton.append(
+      iconEl(collapsed ? "chevron-right" : "chevron-down", "nt-group-chevron"),
+    );
+    const pill = groupButton.createSpan({
+      cls: `nt-pill ${group.color ? `nt-color-${group.color}` : "nt-color-default"}`,
+    });
+    if (group.color) pill.createSpan({ cls: "nt-option-dot" });
+    pill.createSpan({ text: group.label });
+    groupButton.createSpan({ cls: "nt-group-count", text: String(group.rows.length) });
+    groupButton.addEventListener("click", () => {
+      const index = view.collapsedGroups.indexOf(group.key);
+      if (index >= 0) view.collapsedGroups.splice(index, 1);
+      else view.collapsedGroups.push(group.key);
+      this.persist();
+      this.renderTablePreserveScroll();
+    });
   }
 
   private viewIcon(view: ViewConfig): string {
@@ -766,6 +889,7 @@ export class NotionTableView extends TextFileView {
   }
 
   private renderChartView(): void {
+    this.tableRenderToken += 1;
     if (!this.db || !this.tableHostEl) return;
     const db = this.db;
     const view = this.activeView!;
@@ -1202,8 +1326,14 @@ export class NotionTableView extends TextFileView {
   }
 
   private renderBulkBar(parent: HTMLElement): void {
-    const bar = parent.createDiv({ cls: "nt-bulk-bar" });
-    bar.createSpan({
+    const bar = h("div", "nt-bulk-bar");
+    if (this.tableScrollEl && this.tableScrollEl.parentElement === parent) {
+      parent.insertBefore(bar, this.tableScrollEl);
+    } else {
+      parent.append(bar);
+    }
+    this.bulkBarEl = bar;
+    this.bulkCountEl = bar.createSpan({
       cls: "nt-bulk-count",
       text: `已选择 ${this.selectedRows.size} 项`,
     });
@@ -1219,8 +1349,42 @@ export class NotionTableView extends TextFileView {
     });
     cancel.addEventListener("click", () => {
       this.selectedRows.clear();
-      this.renderTablePreserveScroll();
+      this.updateSelectionUi();
     });
+  }
+
+  private updateSelectionUi(): void {
+    if (this.tableEl) {
+      for (const tr of Array.from(
+        this.tableEl.querySelectorAll<HTMLTableRowElement>("tr.nt-data-row"),
+      )) {
+        const id = tr.dataset.rowId;
+        if (id) this.syncRowSelection(tr, id);
+      }
+    }
+    if (this.selectedRows.size > 0) {
+      if (this.bulkBarEl) {
+        this.bulkCountEl?.setText(`已选择 ${this.selectedRows.size} 项`);
+      } else if (this.tableHostEl) {
+        this.renderBulkBar(this.tableHostEl);
+      }
+    } else if (this.bulkBarEl) {
+      this.bulkBarEl.remove();
+      this.bulkBarEl = null;
+      this.bulkCountEl = null;
+    }
+    this.updateSelectAllState();
+  }
+
+  private updateSelectAllState(): void {
+    if (!this.selectAllEl) return;
+    const total = this.currentRows.length;
+    let selected = 0;
+    for (const row of this.currentRows) {
+      if (this.selectedRows.has(row.id)) selected += 1;
+    }
+    this.selectAllEl.checked = total > 0 && selected === total;
+    this.selectAllEl.indeterminate = selected > 0 && selected < total;
   }
 
   private renderTableHead(
@@ -1237,6 +1401,7 @@ export class NotionTableView extends TextFileView {
       type: "checkbox",
       attr: { "aria-label": "选择全部记录" },
     });
+    this.selectAllEl = selectAll;
     const selectedVisible = rows.filter((row) => this.selectedRows.has(row.id)).length;
     selectAll.checked = rows.length > 0 && selectedVisible === rows.length;
     selectAll.indeterminate = selectedVisible > 0 && selectedVisible < rows.length;
@@ -1246,7 +1411,7 @@ export class NotionTableView extends TextFileView {
       } else {
         for (const row of rows) this.selectedRows.delete(row.id);
       }
-      this.renderTablePreserveScroll();
+      this.updateSelectionUi();
     });
 
     const view = this.activeView!;
@@ -1329,29 +1494,194 @@ export class NotionTableView extends TextFileView {
         button.createSpan({ cls: "nt-calc-placeholder", text: "计算" });
       } else {
         button.createSpan({ cls: "nt-calc-label", text: calculationLabel(configured) });
-        button.createSpan({ cls: "nt-calc-value", text: value || "—" });
+        this.calcValueEls.set(
+          property.id,
+          button.createSpan({ cls: "nt-calc-value", text: value || "—" }),
+        );
       }
       button.addEventListener("click", () => this.openCalculationMenu(button, property));
     }
     tr.createEl("td", { cls: "nt-calculation-cell" });
   }
 
+  private bindTableEvents(tbody: HTMLTableSectionElement): void {
+    tbody.addEventListener("click", (event) => this.handleTableClick(event));
+    tbody.addEventListener("keydown", (event) => this.handleTableKeydown(event));
+    tbody.addEventListener("change", (event) => this.handleTableChange(event));
+    tbody.addEventListener("contextmenu", (event) => this.handleTableContextMenu(event));
+    tbody.addEventListener("focusin", (event) => this.handleTableFocusIn(event));
+  }
+
+  private handleTableFocusIn(event: FocusEvent): void {
+    const target = event.target as HTMLElement | null;
+    const td = target?.closest<HTMLElement>("td.nt-cell");
+    if (td) this.setRovingTabStop(td);
+  }
+
+  private setRovingTabStop(td: HTMLElement): void {
+    if (td === this.rovingTabEl) return;
+    if (this.rovingTabEl?.isConnected) this.rovingTabEl.tabIndex = -1;
+    td.tabIndex = 0;
+    this.rovingTabEl = td;
+  }
+
+  private ensureRovingTabStop(): void {
+    if (this.rovingTabEl?.isConnected) return;
+    this.rovingTabEl = null;
+    const first = this.tableEl?.querySelector<HTMLElement>("tr.nt-data-row td.nt-cell");
+    if (first) this.setRovingTabStop(first);
+  }
+
+  private moveCellFocus(td: HTMLElement, dx: number, dy: number): void {
+    const tr = td.closest<HTMLTableRowElement>("tr.nt-data-row");
+    if (!tr) return;
+    const cells = Array.from(tr.querySelectorAll<HTMLElement>("td.nt-cell"));
+    const column = cells.indexOf(td);
+    if (column < 0) return;
+    if (dx !== 0) {
+      const target = cells[column + dx];
+      if (target) {
+        this.setRovingTabStop(target);
+        target.focus();
+      }
+      return;
+    }
+    let sibling =
+      dy < 0 ? tr.previousElementSibling : tr.nextElementSibling;
+    while (sibling && !sibling.classList.contains("nt-data-row")) {
+      sibling = dy < 0 ? sibling.previousElementSibling : sibling.nextElementSibling;
+    }
+    const targetRow = sibling as HTMLTableRowElement | null;
+    const targetCells = targetRow?.querySelectorAll<HTMLElement>("td.nt-cell");
+    if (!targetCells || targetCells.length === 0) return;
+    const target = targetCells[Math.min(column, targetCells.length - 1)];
+    if (target) {
+      this.setRovingTabStop(target);
+      target.focus();
+    }
+  }
+
+  private rowEntryFor(
+    target: HTMLElement | null,
+  ): { tr: HTMLTableRowElement; row: DatabaseRow } | null {
+    const tr = target?.closest<HTMLTableRowElement>("tr.nt-data-row");
+    if (!tr) return null;
+    const rowId = tr.dataset.rowId;
+    const row = rowId ? this.rowsById.get(rowId) : undefined;
+    return row ? { tr, row } : null;
+  }
+
+  private handleTableClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const entry = this.rowEntryFor(target);
+    const action = target.closest<HTMLElement>(".nt-row-action");
+    if (action && entry) {
+      if (action.classList.contains("nt-row-action-open")) this.openRowPage(entry.row);
+      else this.openRowMenu(action, entry.row);
+      return;
+    }
+    if (entry && target.closest(".nt-row-emoji")) {
+      this.openRowPage(entry.row);
+      return;
+    }
+    if (target.closest("button, a, input, .nt-checkbox")) return;
+    const td = target.closest<HTMLElement>("td.nt-cell");
+    if (!td || td.classList.contains("is-editing")) return;
+    const row = td.dataset.rowId ? this.rowsById.get(td.dataset.rowId) : undefined;
+    const property = td.dataset.propertyId
+      ? this.propertiesById.get(td.dataset.propertyId)
+      : undefined;
+    if (!row || !property || isReadOnlyProperty(property)) return;
+    this.setRovingTabStop(td);
+    this.activateCell(td, row, property);
+  }
+
+  private handleTableKeydown(event: KeyboardEvent): void {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const td = target.closest<HTMLElement>("td.nt-cell");
+    if (!td || td !== target) return;
+    this.setRovingTabStop(td);
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      this.moveCellFocus(td, -1, 0);
+      return;
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      this.moveCellFocus(td, 1, 0);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      this.moveCellFocus(td, 0, -1);
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      this.moveCellFocus(td, 0, 1);
+      return;
+    }
+    const row = td.dataset.rowId ? this.rowsById.get(td.dataset.rowId) : undefined;
+    const property = td.dataset.propertyId
+      ? this.propertiesById.get(td.dataset.propertyId)
+      : undefined;
+    if (!row || !property || isReadOnlyProperty(property)) return;
+    if (event.key === "Enter" || event.key === "F2") {
+      event.preventDefault();
+      this.activateCell(td, row, property);
+    }
+    if (event.key === " " && property.type === "checkbox") {
+      event.preventDefault();
+      this.toggleCellCheckbox(row, property);
+    }
+  }
+
+  private handleTableChange(event: Event): void {
+    const input = event.target as HTMLInputElement | null;
+    if (!input || !input.classList.contains("nt-checkbox-input")) return;
+    if (!input.closest(".nt-row-gutter")) return;
+    const entry = this.rowEntryFor(input);
+    if (!entry) return;
+    if (input.checked) this.selectedRows.add(entry.row.id);
+    else this.selectedRows.delete(entry.row.id);
+    this.updateSelectionUi();
+  }
+
+  private handleTableContextMenu(event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    const entry = this.rowEntryFor(target);
+    if (!entry) return;
+    event.preventDefault();
+    const anchor =
+      target?.closest<HTMLElement>("td") ||
+      entry.tr.querySelector<HTMLElement>(".nt-cell");
+    if (anchor) this.openRowMenu(anchor, entry.row);
+  }
+
   private appendDataRow(
-    tbody: HTMLTableSectionElement,
+    container: DocumentFragment | HTMLTableSectionElement,
     row: DatabaseRow,
     properties: DatabaseProperty[],
+    reusableRows?: Map<string, HTMLTableRowElement> | null,
   ): void {
-    const tr = tbody.createEl("tr", {
+    const reusable = reusableRows?.get(row.id);
+    if (reusable) {
+      reusableRows!.delete(row.id);
+      this.syncRowSelection(reusable, row.id);
+      for (const td of Array.from(reusable.querySelectorAll<HTMLElement>("td.nt-cell"))) {
+        td.tabIndex = -1;
+      }
+      container.append(reusable);
+      this.rowEls.set(row.id, reusable);
+      return;
+    }
+    const tr = container.createEl("tr", {
       cls: `nt-data-row${this.selectedRows.has(row.id) ? " is-selected" : ""}`,
       attr: { "data-row-id": row.id },
     });
-    tr.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      const anchor =
-        (event.target as HTMLElement).closest("td") ||
-        (tr.querySelector(".nt-cell") as HTMLElement);
-      if (anchor) this.openRowMenu(anchor, row);
-    });
+    this.rowEls.set(row.id, tr);
 
     const gutter = tr.createEl("td", { cls: "nt-row-gutter" });
     const checkbox = gutter.createEl("input", {
@@ -1360,12 +1690,7 @@ export class NotionTableView extends TextFileView {
       attr: { "aria-label": "选择记录" },
     });
     checkbox.checked = this.selectedRows.has(row.id);
-    checkbox.addEventListener("click", (event) => event.stopPropagation());
-    checkbox.addEventListener("change", () => {
-      if (checkbox.checked) this.selectedRows.add(row.id);
-      else this.selectedRows.delete(row.id);
-      this.renderTablePreserveScroll();
-    });
+    checkbox.tabIndex = -1;
 
     for (const property of properties) {
       const td = tr.createEl("td", {
@@ -1373,32 +1698,19 @@ export class NotionTableView extends TextFileView {
         attr: {
           "data-row-id": row.id,
           "data-property-id": property.id,
-          tabindex: "0",
+          tabindex: "-1",
         },
       });
-      td.style.width = `${property.width || 170}px`;
       this.renderCellContent(td, row, property);
-      if (!isReadOnlyProperty(property)) {
-        td.addEventListener("click", (event) => {
-          const target = event.target as HTMLElement;
-          if (target.closest("button, a, input, .nt-checkbox")) return;
-          if (td.classList.contains("is-editing")) return;
-          this.activateCell(td, row, property);
-        });
-        td.addEventListener("keydown", (event) => {
-          if (event.target !== td) return;
-          if (event.key === "Enter" || event.key === "F2") {
-            event.preventDefault();
-            this.activateCell(td, row, property);
-          }
-          if (event.key === " " && property.type === "checkbox") {
-            event.preventDefault();
-            this.toggleCellCheckbox(row, property);
-          }
-        });
-      }
     }
     tr.createEl("td", { cls: "nt-add-column nt-add-column-cell" });
+  }
+
+  private syncRowSelection(tr: HTMLTableRowElement, rowId: string): void {
+    const selected = this.selectedRows.has(rowId);
+    tr.toggleClass("is-selected", selected);
+    const checkbox = tr.querySelector<HTMLInputElement>(".nt-row-gutter .nt-checkbox-input");
+    if (checkbox) checkbox.checked = selected;
   }
 
   private appendEmptyState(tbody: HTMLTableSectionElement, colspan: number): void {
@@ -1479,6 +1791,7 @@ export class NotionTableView extends TextFileView {
   private renderCellContent(td: HTMLElement, row: DatabaseRow, property: DatabaseProperty): void {
     clear(td);
     td.removeClass("is-editing");
+    td.removeClass("nt-cell-empty");
     const value = getCell(row, property);
     if (property.type === "title") {
       this.renderTitleCell(td, row, property, value);
@@ -1486,16 +1799,13 @@ export class NotionTableView extends TextFileView {
     }
     if (property.type === "checkbox") {
       const checked = value === true;
-      const box = h(
-        "span",
-        `nt-checkbox nt-cell-checkbox${checked ? " is-checked" : ""}`,
+      td.append(
+        h("span", `nt-checkbox nt-cell-checkbox${checked ? " is-checked" : ""}`),
       );
-      box.append(iconEl("check", "nt-check-icon"));
-      td.append(box);
       return;
     }
     if (isCellEmpty(value)) {
-      td.append(h("span", "nt-empty-value"));
+      td.addClass("nt-cell-empty");
       return;
     }
 
@@ -1508,7 +1818,7 @@ export class NotionTableView extends TextFileView {
       case "status": {
         const option = optionById(property, value);
         if (!option) {
-          td.append(h("span", "nt-empty-value"));
+          td.addClass("nt-cell-empty");
           break;
         }
         const pill = h("span", `nt-pill ${colorClass(option.color)}`);
@@ -1525,8 +1835,8 @@ export class NotionTableView extends TextFileView {
           if (!option) continue;
           wrap.append(h("span", `nt-tag ${colorClass(option.color)}`, option.name));
         }
-        if (wrap.childElementCount === 0) wrap.append(h("span", "nt-empty-value"));
-        td.append(wrap);
+        if (wrap.childElementCount === 0) td.addClass("nt-cell-empty");
+        else td.append(wrap);
         break;
       }
       case "date": {
@@ -1535,7 +1845,6 @@ export class NotionTableView extends TextFileView {
           "span",
           `nt-date-value${isDateOverdue(dateValue, this.isRowDone(row)) ? " is-overdue" : ""}`,
         );
-        span.append(iconEl("calendar", "nt-cell-inline-icon"));
         span.append(h("span", "", formatDateValue(dateValue)));
         td.append(span);
         break;
@@ -1546,29 +1855,22 @@ export class NotionTableView extends TextFileView {
         link.href = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(url) ? url : `https://${url}`;
         link.target = "_blank";
         link.rel = "noopener";
-        link.append(iconEl("link", "nt-cell-inline-icon"));
         link.append(h("span", "", url.replace(/^https?:\/\//, "")));
-        link.addEventListener("click", (event) => event.stopPropagation());
         td.append(link);
         break;
       }
       case "email": {
-        const link = h("a", "nt-link-value") as HTMLAnchorElement;
+        const link = h("a", "nt-link-value nt-mail-link") as HTMLAnchorElement;
         link.href = `mailto:${String(value)}`;
-        link.append(iconEl("mail", "nt-cell-inline-icon"));
         link.append(h("span", "", String(value)));
-        link.addEventListener("click", (event) => event.stopPropagation());
         td.append(link);
         break;
       }
       case "created_time":
       case "last_edited_time": {
-        const span = h("span", "nt-readonly-value");
-        span.append(
-          iconEl(
-            property.type === "created_time" ? "clock" : "history",
-            "nt-cell-inline-icon",
-          ),
+        const span = h(
+          "span",
+          `nt-readonly-value nt-time-${property.type === "created_time" ? "created" : "edited"}`,
         );
         span.append(h("span", "", formatTimestamp(Number(value), true)));
         td.append(span);
@@ -1587,8 +1889,7 @@ export class NotionTableView extends TextFileView {
   ): void {
     const text = String(value ?? "");
     const wrap = h("div", "nt-title-cell");
-    const emoji = h("span", "nt-row-emoji", row.icon || "");
-    if (row.icon) wrap.append(emoji);
+    if (row.icon) wrap.append(h("span", "nt-row-emoji", row.icon));
     const title = h(
       "span",
       `nt-cell-text${text ? "" : " is-placeholder"}`,
@@ -1596,59 +1897,112 @@ export class NotionTableView extends TextFileView {
     );
     wrap.append(title);
     const actions = h("div", "nt-title-actions");
-    const open = h("button", "nt-row-action") as HTMLButtonElement;
+    const open = h("button", "nt-row-action nt-row-action-open") as HTMLButtonElement;
     open.type = "button";
+    open.tabIndex = -1;
     open.title = "打开记录页面";
     open.setAttribute("aria-label", "打开记录页面");
-    open.append(iconEl("maximize-2", "nt-icon"));
-    open.addEventListener("click", (event) => {
-      event.stopPropagation();
-      this.openRowPage(row);
-    });
-    const menu = h("button", "nt-row-action") as HTMLButtonElement;
+    const menu = h("button", "nt-row-action nt-row-action-menu") as HTMLButtonElement;
     menu.type = "button";
+    menu.tabIndex = -1;
     menu.title = "记录选项";
     menu.setAttribute("aria-label", "记录选项");
-    menu.append(iconEl("more-horizontal", "nt-icon"));
-    menu.addEventListener("click", (event) => {
-      event.stopPropagation();
-      this.openRowMenu(menu, row);
-    });
     actions.append(open, menu);
     wrap.append(actions);
-    if (row.icon) {
-      emoji.addEventListener("click", (event) => {
-        event.stopPropagation();
-        this.openRowPage(row);
-      });
-    }
     td.append(wrap);
     td.addClass("nt-title-td");
     void property;
   }
 
   private isRowDone(row: DatabaseRow): boolean {
+    const cached = this.rowDoneCache.get(row.id);
+    if (cached !== undefined) return cached;
     if (!this.db) return false;
+    let done = false;
     const checkboxes = this.db.properties.filter(
       (property) =>
         property.type === "checkbox" && /完成|done|complete|finish/i.test(property.name),
     );
     for (const property of checkboxes) {
-      if (getCell(row, property) === true) return true;
+      if (getCell(row, property) === true) {
+        done = true;
+        break;
+      }
     }
-    const status = this.db.properties.find((property) => property.type === "status");
-    if (status) {
-      const name = optionById(status, getCell(row, status))?.name || "";
-      return /已完成|完成|done|complete/i.test(name);
+    if (!done) {
+      const status = this.db.properties.find((property) => property.type === "status");
+      if (status) {
+        const name = optionById(status, getCell(row, status))?.name || "";
+        done = /已完成|完成|done|complete/i.test(name);
+      }
     }
-    return false;
+    this.rowDoneCache.set(row.id, done);
+    return done;
   }
 
   private toggleCellCheckbox(row: DatabaseRow, property: DatabaseProperty): void {
     if (!this.db) return;
     setCell(row, property, getCell(row, property) !== true);
     this.persist();
-    this.renderTablePreserveScroll();
+    this.refreshAfterCellEdit(row, property);
+  }
+
+  private viewDependsOnEdit(view: ViewConfig, property: DatabaseProperty): boolean {
+    if (view.search.trim()) return true;
+    // Any edit bumps updatedAt, so views keyed on last_edited_time are affected too.
+    const affected = (id: string | null | undefined): boolean => {
+      if (!id) return false;
+      const target = this.propertiesById.get(id);
+      return Boolean(target && (target.id === property.id || target.type === "last_edited_time"));
+    };
+    return (
+      affected(view.groupBy) ||
+      view.filters.some((rule) => affected(rule.propertyId)) ||
+      view.sorts.some((sort) => affected(sort.propertyId))
+    );
+  }
+
+  private refreshAfterCellEdit(row: DatabaseRow, property: DatabaseProperty): void {
+    if (!this.db) return;
+    const view = this.activeView;
+    if (!view) return;
+    this.rowDoneCache.delete(row.id);
+    if (this.viewDependsOnEdit(view, property)) {
+      this.renderTablePreserveScroll(undefined, false);
+      return;
+    }
+    this.refreshRowCells(row, property);
+    this.refreshCalculationCell(property);
+  }
+
+  private refreshRowCells(row: DatabaseRow, property: DatabaseProperty): void {
+    const tr = this.rowEls.get(row.id);
+    if (!tr) {
+      this.renderTablePreserveScroll(undefined, false);
+      return;
+    }
+    const refreshDates = property.type === "checkbox" || property.type === "status";
+    for (const td of Array.from(tr.querySelectorAll<HTMLElement>("td.nt-cell"))) {
+      const propertyId = td.dataset.propertyId;
+      const cellProperty = propertyId ? this.propertiesById.get(propertyId) : undefined;
+      if (!cellProperty) continue;
+      if (
+        cellProperty.id === property.id ||
+        cellProperty.type === "last_edited_time" ||
+        (refreshDates && cellProperty.type === "date")
+      ) {
+        this.renderCellContent(td, row, cellProperty);
+      }
+    }
+  }
+
+  private refreshCalculationCell(property: DatabaseProperty): void {
+    if (!this.db || !this.activeView) return;
+    const valueEl = this.calcValueEls.get(property.id);
+    if (!valueEl) return;
+    const configured = this.activeView.calculations[property.id] || "none";
+    if (configured === "none") return;
+    valueEl.setText(calculate(this.db, property, this.currentRows, configured) || "—");
   }
 
   private activateCell(td: HTMLElement, row: DatabaseRow, property: DatabaseProperty): void {
@@ -1675,6 +2029,7 @@ export class NotionTableView extends TextFileView {
     closeActivePopover();
     const initial = String(getCell(row, property) ?? "");
     clear(td);
+    td.removeClass("nt-cell-empty");
     td.addClass("is-editing");
     const input = td.createEl("input", {
       cls: "nt-cell-input",
@@ -1713,11 +2068,13 @@ export class NotionTableView extends TextFileView {
         value = numeric;
       }
       if (property.type === "title") value = raw.trim();
-      if (String(getCell(row, property) ?? "") !== String(value ?? "")) {
+      const changed = String(getCell(row, property) ?? "") !== String(value ?? "");
+      if (changed) {
         setCell(row, property, value);
         this.persist();
       }
-      this.renderTablePreserveScroll();
+      if (changed) this.refreshAfterCellEdit(row, property);
+      else this.renderCellContent(td, row, property);
     };
     const cancel = () => {
       editor.done = true;
@@ -1781,6 +2138,8 @@ export class NotionTableView extends TextFileView {
       const width = Math.max(80, Math.min(600, startWidth + (moveEvent.clientX - startX)));
       property.width = Math.round(width);
       th.style.width = `${property.width}px`;
+      const col = this.tableColEls.get(property.id);
+      if (col) col.style.width = `${property.width}px`;
       if (table) {
         table.style.width = `${Math.max(680, startTableWidth + (property.width - startWidth))}px`;
       }
@@ -1791,21 +2150,19 @@ export class NotionTableView extends TextFileView {
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
       this.persist();
-      this.renderTablePreserveScroll();
     };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
   }
 
   private findCell(rowId: string, propertyId: string): HTMLElement | null {
-    if (!this.tableEl) return null;
-    const cells = Array.from(this.tableEl.querySelectorAll<HTMLElement>("td.nt-cell"));
-    return (
-      cells.find(
-        (cell) =>
-          cell.dataset.rowId === rowId && cell.dataset.propertyId === propertyId,
-      ) || null
-    );
+    const tr = this.rowEls.get(rowId);
+    if (!tr) return null;
+    for (const child of Array.from(tr.children)) {
+      if (!(child instanceof HTMLElement) || !child.classList.contains("nt-cell")) continue;
+      if (child.dataset.propertyId === propertyId) return child;
+    }
+    return null;
   }
 
   addRowAndFocus(): void {
@@ -1818,9 +2175,9 @@ export class NotionTableView extends TextFileView {
       notify("已添加一条记录，图表已更新");
       return;
     }
-    this.renderTablePreserveScroll();
-    window.requestAnimationFrame(() => {
-      const title = titleProperty(this.db!);
+    this.renderTablePreserveScroll(() => {
+      if (!this.db) return;
+      const title = titleProperty(this.db);
       const cell = this.findCell(row.id, title.id);
       if (cell) {
         cell.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -1869,7 +2226,7 @@ export class NotionTableView extends TextFileView {
         this.persist();
       },
       onCloseRefresh: () => {
-        this.renderTablePreserveScroll();
+        this.renderTablePreserveScroll(undefined, false);
       },
     });
     modal.open();
@@ -2427,9 +2784,9 @@ export class NotionTableView extends TextFileView {
     const index = this.db.rows.findIndex((item) => item.id === row.id);
     this.db.rows.splice(delta < 0 ? index : index + 1, 0, newRow);
     this.persist();
-    this.renderTablePreserveScroll();
-    window.requestAnimationFrame(() => {
-      const title = titleProperty(this.db!);
+    this.renderTablePreserveScroll(() => {
+      if (!this.db) return;
+      const title = titleProperty(this.db);
       const cell = this.findCell(newRow.id, title.id);
       if (cell) this.beginTextEdit(cell, newRow, title);
     });
@@ -3060,7 +3417,7 @@ export class NotionTableView extends TextFileView {
           this.refreshCell(anchor, row, property);
           if (!isMulti) {
             popover.close();
-            this.renderTablePreserveScroll();
+            this.refreshAfterCellEdit(row, property);
           } else {
             renderList();
             search.focus();
@@ -3084,7 +3441,7 @@ export class NotionTableView extends TextFileView {
             setCell(row, property, optionId);
             this.persist();
             popover.close();
-            this.renderTablePreserveScroll();
+            this.refreshAfterCellEdit(row, property);
           }
         };
 
@@ -3337,7 +3694,7 @@ export class NotionTableView extends TextFileView {
             this.persist();
             this.refreshCell(anchor, row, property);
             popover.close();
-            this.renderTablePreserveScroll();
+            this.refreshAfterCellEdit(row, property);
           });
           const done = footer.createEl("button", {
             cls: "nt-button nt-button-primary",
@@ -3345,7 +3702,7 @@ export class NotionTableView extends TextFileView {
           });
           done.addEventListener("click", () => {
             popover.close();
-            this.renderTablePreserveScroll();
+            this.refreshAfterCellEdit(row, property);
           });
         };
 

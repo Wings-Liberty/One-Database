@@ -1,11 +1,21 @@
 import { Menu, Notice, Plugin, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 import { createDatabase, createSampleDatabase, serializeDatabase } from "./model";
+import {
+  DEFAULT_SETTINGS,
+  OneDatabaseSettingTab,
+  OneDatabaseSettings,
+  parseStoredTablePageSize,
+} from "./settings";
 import { FILE_EXTENSION, VIEW_TYPE } from "./types";
 import { NotionTableView } from "./view";
 import { promptText, sanitizeFilename } from "./ui/dom";
 
 export default class NotionTablePlugin extends Plugin {
+  settings: OneDatabaseSettings = { ...DEFAULT_SETTINGS };
+
   async onload(): Promise<void> {
+    await this.loadSettings();
+    this.addSettingTab(new OneDatabaseSettingTab(this.app, this));
     this.registerView(VIEW_TYPE, (leaf: WorkspaceLeaf) => new NotionTableView(leaf, this));
     this.registerExtensions([FILE_EXTENSION], VIEW_TYPE);
 
@@ -77,6 +87,38 @@ export default class NotionTablePlugin extends Plugin {
 
   onunload(): void {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+  }
+
+  private async loadSettings(): Promise<void> {
+    try {
+      const data = (await this.loadData()) as Partial<OneDatabaseSettings> | null;
+      const hasPageSize = Boolean(
+        data && Object.prototype.hasOwnProperty.call(data, "tablePageSize"),
+      );
+      this.settings = {
+        tablePageSize: hasPageSize
+          ? parseStoredTablePageSize(data!.tablePageSize)
+          : DEFAULT_SETTINGS.tablePageSize,
+      };
+    } catch (error) {
+      console.error("One Database: could not load settings", error);
+      this.settings = { ...DEFAULT_SETTINGS };
+    }
+  }
+
+  async updateTablePageSize(size: number | null): Promise<void> {
+    const next = size === null ? null : Math.max(1, Math.floor(size));
+    if (next === this.settings.tablePageSize) return;
+    this.settings = { ...this.settings, tablePageSize: next };
+    await this.saveData(this.settings);
+    this.refreshTableViews();
+  }
+
+  private refreshTableViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      const view = leaf.view;
+      if (view instanceof NotionTableView) view.refreshTablePageSize();
+    }
   }
 
   private defaultFolder(folder?: TFolder): string {

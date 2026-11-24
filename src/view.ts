@@ -116,6 +116,8 @@ const EMOJI_CHOICES = [
 ];
 
 const TABLE_ROW_CHUNK = 80;
+/** How close to the bottom the table must be before the next batch is loaded. */
+const TABLE_SCROLL_LOAD_THRESHOLD = 320;
 
 type TableRenderEntry =
   | { kind: "group"; group: RowGroup; collapsed: boolean }
@@ -124,6 +126,10 @@ type TableRenderEntry =
 interface TableRenderOptions {
   afterRender?: () => void;
   reuseRows?: boolean;
+  /** Include this row in the initial window, even if it is past the current batch. */
+  ensureRowId?: string;
+  /** Start over from the first batch instead of keeping the previously loaded range. */
+  resetWindow?: boolean;
 }
 
 interface ActiveEditor {
@@ -165,6 +171,9 @@ export class NotionTableView extends TextFileView {
   private bulkCountEl: HTMLElement | null = null;
   private selectAllEl: HTMLInputElement | null = null;
   private tableRenderToken = 0;
+  private tableQuerySignatureCache = "";
+  private tableLoadedCount = 0;
+  private tableLoadedRowCount = 0;
   private selectedRows = new Set<string>();
   private searchTimer: number | null = null;
   private saveTimer: number | null = null;
@@ -284,6 +293,9 @@ export class NotionTableView extends TextFileView {
     this.poolSignature = null;
     this.tableColEls.clear();
     this.calcValueEls.clear();
+    this.tableQuerySignatureCache = "";
+    this.tableLoadedCount = 0;
+    this.tableLoadedRowCount = 0;
   }
 
   setViewData(data: string, _clear: boolean): void {
@@ -293,6 +305,9 @@ export class NotionTableView extends TextFileView {
     try {
       this.db = parseDatabaseJson(data);
       this.loadError = "";
+      this.tableLoadedCount = 0;
+      this.tableLoadedRowCount = 0;
+      this.tableQuerySignatureCache = "";
       this.renderAll();
     } catch (error) {
       console.error("One Database: could not parse database", error);
@@ -667,7 +682,11 @@ export class NotionTableView extends TextFileView {
     button.append(badge);
   }
 
-  private renderTablePreserveScroll(afterRender?: () => void, reuseRows = true): void {
+  private renderTablePreserveScroll(
+    afterRender?: () => void,
+    reuseRows = true,
+    ensureRowId?: string,
+  ): void {
     if (this.activeView?.type === "chart") {
       this.renderChartView();
       afterRender?.();
@@ -675,17 +694,46 @@ export class NotionTableView extends TextFileView {
     }
     const top = this.tableScrollEl?.scrollTop ?? 0;
     const left = this.tableScrollEl?.scrollLeft ?? 0;
-    this.renderTable({
+    const resetScroll = this.renderTable({
       reuseRows,
+      ensureRowId,
       afterRender: () => {
         window.requestAnimationFrame(() => {
           if (this.tableScrollEl) {
-            this.tableScrollEl.scrollTop = top;
-            this.tableScrollEl.scrollLeft = left;
+            this.tableScrollEl.scrollTop = resetScroll ? 0 : top;
+            this.tableScrollEl.scrollLeft = resetScroll ? 0 : left;
           }
           afterRender?.();
         });
       },
+    });
+  }
+
+  /**
+   * Changing the batch size takes effect immediately: the table starts over from
+   * the first batch so the new chunk size is visible from the top of the view.
+   */
+  refreshTablePageSize(): void {
+    if (!this.db || !this.tableHostEl || this.activeView?.type === "chart") return;
+    this.tableLoadedCount = 0;
+    this.tableLoadedRowCount = 0;
+    this.renderTable({ reuseRows: false, resetWindow: true });
+  }
+
+  private tablePageSize(): number | null {
+    const size = this.plugin.settings?.tablePageSize;
+    if (typeof size !== "number" || !Number.isFinite(size) || size <= 0) return null;
+    return Math.max(1, Math.floor(size));
+  }
+
+  private tableQuerySignature(view: ViewConfig): string {
+    return JSON.stringify({
+      id: view.id,
+      conjunction: view.conjunction,
+      filters: view.filters,
+      sorts: view.sorts,
+      search: view.search,
+      groupBy: view.groupBy,
     });
   }
 
@@ -702,10 +750,10 @@ export class NotionTableView extends TextFileView {
       .join("\u0004");
   }
 
-  private renderTable(options: TableRenderOptions = {}): void {
+  private renderTable(options: TableRenderOptions = {}): boolean {
     if (!this.db || !this.tableHostEl) {
       options.afterRender?.();
-      return;
+      return false;
     }
     const token = ++this.tableRenderToken;
     const db = this.db;
@@ -715,6 +763,15 @@ export class NotionTableView extends TextFileView {
     this.rowDoneCache.clear();
     const rows = filteredRows(db, view);
     this.currentRows = rows;
+
+    const querySignature = this.tableQuerySignature(view);
+    const resetWindow =
+      options.resetWindow === true || querySignature !== this.tableQuerySignatureCache;
+    this.tableQuerySignatureCache = querySignature;
+    if (resetWindow) {
+      this.tableLoadedCount = 0;
+      this.tableLoadedRowCount = 0;
+    }
 
     for (const id of Array.from(this.selectedRows)) {
       if (!this.rowsById.has(id)) this.selectedRows.delete(id);
@@ -804,7 +861,37 @@ export class NotionTableView extends TextFileView {
     if (view.showCalculations) this.renderCalculationFooter(table, properties, rows);
     this.updateTableCount(rows.length);
 
-    if (entries.length > TABLE_ROW_CHUNK) {
+    const pageSize = this.tablePageSize();
+    // Group headers are render entries too, but the setting counts records, so
+    // the window is expanded until it contains the requested number of rows.
+    const entryLimitForRows = (start: number, rowBudget: number): number => {
+      let index = start;
+      let counted = 0;
+      while (index < entries.length && counted < rowBudget) {
+        if (entries[index].kind === "row") counted += 1;
+        index += 1;
+      }
+      // When every remaining row is already loaded, trailing headers of empty
+      // groups can be added without waiting for another scroll.
+      let scan = index;
+      while (scan < entries.length && entries[scan].kind === "group") scan += 1;
+      if (scan >= entries.length) index = entries.length;
+      return index;
+    };
+    let initialCount = entries.length;
+    if (pageSize !== null) {
+      const rowBudget = Math.max(pageSize, resetWindow ? 0 : this.tableLoadedRowCount);
+      initialCount = entryLimitForRows(0, rowBudget);
+      if (options.ensureRowId) {
+        const ensureIndex = entries.findIndex(
+          (entry) => entry.kind === "row" && entry.row.id === options.ensureRowId,
+        );
+        if (ensureIndex >= 0) initialCount = Math.max(initialCount, ensureIndex + 1);
+      }
+      initialCount = Math.min(initialCount, entries.length);
+    }
+
+    if (initialCount > TABLE_ROW_CHUNK) {
       const total = db.rows.length;
       this.tableCountEl?.setText(
         rows.length === total
@@ -813,32 +900,117 @@ export class NotionTableView extends TextFileView {
       );
     }
 
+    let loadMoreEl: HTMLTableRowElement | null = null;
+    let loadedRowCount = 0;
     let cursor = 0;
-    const renderChunk = () => {
+    let busy = true;
+
+    const updateLoadMoreIndicator = (): void => {
+      if (!loadMoreEl) return;
+      if (this.tableLoadedCount >= entries.length) {
+        loadMoreEl.remove();
+        loadMoreEl = null;
+        return;
+      }
+      const textEl = loadMoreEl.querySelector<HTMLElement>(".nt-load-more-text");
+      textEl?.setText(`已显示 ${loadedRowCount} / ${rows.length} 条记录，向下滚动加载更多`);
+    };
+
+    const pump = (
+      limit: number,
+      reusable: Map<string, HTMLTableRowElement> | null,
+      done: () => void,
+    ): void => {
       if (token !== this.tableRenderToken) return;
+      const target = Math.min(limit, entries.length);
       const fragment = document.createDocumentFragment();
-      const end = Math.min(entries.length, cursor + TABLE_ROW_CHUNK);
+      const end = Math.min(target, cursor + TABLE_ROW_CHUNK);
       for (; cursor < end; cursor += 1) {
         const entry = entries[cursor];
         if (entry.kind === "group") {
           this.appendGroupRow(fragment, entry.group, entry.collapsed, properties, view);
         } else {
-          this.appendDataRow(fragment, entry.row, properties, previousRows);
+          this.appendDataRow(fragment, entry.row, properties, reusable);
+          loadedRowCount += 1;
         }
       }
       if (fragment.childNodes.length > 0) {
-        if (addRowEl) tbody.insertBefore(fragment, addRowEl);
+        const anchor = loadMoreEl ?? addRowEl;
+        if (anchor && anchor.parentElement === tbody) tbody.insertBefore(fragment, anchor);
         else tbody.append(fragment);
       }
-      if (cursor < entries.length) {
-        window.requestAnimationFrame(renderChunk);
+      this.tableLoadedCount = cursor;
+      this.tableLoadedRowCount = loadedRowCount;
+      updateLoadMoreIndicator();
+      if (cursor < target) {
+        window.requestAnimationFrame(() => pump(limit, reusable, done));
         return;
       }
+      done();
+    };
+
+    const nearBottom = (): boolean => {
+      if (this.tableScrollEl !== scroll) return false;
+      return (
+        scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <=
+        TABLE_SCROLL_LOAD_THRESHOLD
+      );
+    };
+
+    const startAppend = (): void => {
+      if (busy || token !== this.tableRenderToken) return;
+      if (pageSize === null || this.tableLoadedCount >= entries.length) return;
+      busy = true;
+      loadMoreEl?.addClass("is-loading");
+      const target = entryLimitForRows(this.tableLoadedCount, pageSize);
+      pump(target, null, () => {
+        busy = false;
+        loadMoreEl?.removeClass("is-loading");
+        updateLoadMoreIndicator();
+        scheduleCheck();
+      });
+    };
+
+    // Break the load loop out of the current call stack so tiny batch sizes
+    // cannot recurse indefinitely while filling a tall viewport.
+    const scheduleCheck = (): void => {
+      window.requestAnimationFrame(() => {
+        if (!busy && nearBottom()) startAppend();
+      });
+    };
+
+    if (pageSize !== null && initialCount < entries.length) {
+      loadMoreEl = tbody.createEl("tr", { cls: "nt-load-more-row" });
+      const cell = loadMoreEl.createEl("td", {
+        attr: { colspan: String(properties.length + 2) },
+      });
+      const button = cell.createEl("button", {
+        cls: "nt-load-more-button",
+        attr: { type: "button", "aria-label": "加载更多记录" },
+      });
+      button.createSpan({ cls: "nt-load-more-spinner" });
+      button.createSpan({ cls: "nt-load-more-text", text: "" });
+      button.addEventListener("click", () => startAppend());
+      if (addRowEl) tbody.insertBefore(loadMoreEl, addRowEl);
+      updateLoadMoreIndicator();
+    }
+
+    const handleNearBottom = (): void => {
+      if (!busy && nearBottom()) startAppend();
+    };
+    scroll.addEventListener("scroll", handleNearBottom, { passive: true });
+    scroll.addEventListener("wheel", handleNearBottom, { passive: true });
+
+    pump(initialCount, previousRows, () => {
+      busy = false;
       this.ensureRovingTabStop();
       this.updateTableCount(rows.length);
+      updateLoadMoreIndicator();
       options.afterRender?.();
-    };
-    renderChunk();
+      scheduleCheck();
+    });
+
+    return resetWindow;
   }
 
   private appendGroupRow(
@@ -2175,17 +2347,21 @@ export class NotionTableView extends TextFileView {
       notify("已添加一条记录，图表已更新");
       return;
     }
-    this.renderTablePreserveScroll(() => {
-      if (!this.db) return;
-      const title = titleProperty(this.db);
-      const cell = this.findCell(row.id, title.id);
-      if (cell) {
-        cell.scrollIntoView({ block: "nearest", inline: "nearest" });
-        this.beginTextEdit(cell, row, title);
-      } else {
-        notify("新记录已被当前筛选条件隐藏");
-      }
-    });
+    this.renderTablePreserveScroll(
+      () => {
+        if (!this.db) return;
+        const title = titleProperty(this.db);
+        const cell = this.findCell(row.id, title.id);
+        if (cell) {
+          cell.scrollIntoView({ block: "nearest", inline: "nearest" });
+          this.beginTextEdit(cell, row, title);
+        } else {
+          notify("新记录已被当前筛选条件隐藏");
+        }
+      },
+      true,
+      row.id,
+    );
   }
 
   private async deleteSelectedRows(): Promise<void> {
@@ -2775,7 +2951,7 @@ export class NotionTableView extends TextFileView {
     const index = this.db.rows.findIndex((item) => item.id === row.id);
     this.db.rows.splice(index + 1, 0, copy);
     this.persist();
-    this.renderTablePreserveScroll();
+    this.renderTablePreserveScroll(undefined, true, copy.id);
   }
 
   private insertRowRelative(row: DatabaseRow, delta: number): void {
@@ -2784,12 +2960,16 @@ export class NotionTableView extends TextFileView {
     const index = this.db.rows.findIndex((item) => item.id === row.id);
     this.db.rows.splice(delta < 0 ? index : index + 1, 0, newRow);
     this.persist();
-    this.renderTablePreserveScroll(() => {
-      if (!this.db) return;
-      const title = titleProperty(this.db);
-      const cell = this.findCell(newRow.id, title.id);
-      if (cell) this.beginTextEdit(cell, newRow, title);
-    });
+    this.renderTablePreserveScroll(
+      () => {
+        if (!this.db) return;
+        const title = titleProperty(this.db);
+        const cell = this.findCell(newRow.id, title.id);
+        if (cell) this.beginTextEdit(cell, newRow, title);
+      },
+      true,
+      newRow.id,
+    );
   }
 
   private async deleteRow(row: DatabaseRow): Promise<void> {

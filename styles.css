@@ -1457,6 +1457,56 @@ body.nt-resizing-column * {
   height: 14px;
 }
 
+/* Infinite scroll footer */
+
+.nt-load-more-row td {
+  height: 38px;
+  padding: 0;
+  border-bottom: 1px solid var(--nt-border);
+  background: var(--nt-bg);
+}
+
+.nt-load-more-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--nt-text-faint);
+  font-size: 12.5px;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.nt-load-more-button:hover {
+  color: var(--nt-text);
+  background: var(--nt-hover);
+}
+
+.nt-load-more-row.is-loading .nt-load-more-button {
+  cursor: progress;
+  color: var(--nt-text-secondary);
+}
+
+.nt-load-more-spinner {
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid var(--nt-border-strong);
+  border-top-color: var(--nt-blue);
+  border-radius: 50%;
+  opacity: 0;
+  animation: nt-spin 750ms linear infinite;
+}
+
+.nt-load-more-row.is-loading .nt-load-more-spinner {
+  opacity: 1;
+}
+
 .nt-add-column-cell {
   border-bottom: 1px solid var(--nt-border);
   background: var(--nt-bg);
@@ -3304,3 +3354,26 @@ body.nt-resizing-column * {
     margin-top: 12px;
   }
 }
+
+/* ---------- Plugin settings ---------- */
+
+.nt-settings-page-size {
+  width: 120px;
+  text-align: right;
+}
+
+.nt-settings-page-size.is-invalid {
+  border-color: var(--text-error, #d44c47);
+}
+
+.nt-settings-feedback {
+  margin: -8px 0 18px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.nt-settings-feedback.is-error {
+  color: var(--text-error, #d44c47);
+}
+

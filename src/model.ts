@@ -5,6 +5,11 @@ import {
   ChartConfig,
   ChartDateGrain,
   ChartKind,
+  DASHBOARD_MAX_WIDGETS,
+  DashboardConfig,
+  DashboardWidget,
+  DashboardWidgetHeight,
+  DashboardWidgetSpan,
   DatabaseData,
   DatabaseProperty,
   DatabaseRow,
@@ -87,6 +92,7 @@ export function createView(name = "表格"): ViewConfig {
     collapsedGroups: [],
     wrapText: false,
     chart: defaultChartConfig([], "line"),
+    dashboard: { widgets: [] },
   };
 }
 
@@ -99,6 +105,91 @@ export function createChartView(
   view.type = "chart";
   view.chart = defaultChartConfig(db.properties, kind);
   return view;
+}
+
+export function createDashboardWidget(
+  viewId: string,
+  options: {
+    span?: DashboardWidgetSpan;
+    height?: DashboardWidgetHeight;
+  } = {},
+): DashboardWidget {
+  return {
+    id: uid("widget"),
+    viewId,
+    span: options.span || 2,
+    height: options.height || "standard",
+  };
+}
+
+/**
+ * A layout that makes a new dashboard useful right away: a primary table beside
+ * the charts, followed by the remaining table views. Views are only referenced,
+ * never copied.
+ */
+export function recommendedDashboardWidgets(
+  db: DatabaseData,
+  excludeViewId?: string,
+): DashboardWidget[] {
+  const sources = db.views.filter(
+    (view) => view.type !== "dashboard" && view.id !== excludeViewId,
+  );
+  const tables = sources.filter((view) => view.type === "table");
+  const charts = sources.filter((view) => view.type === "chart");
+  const primaryTable = tables[0];
+  const otherTables = tables.slice(1);
+  const widgets: DashboardWidget[] = [];
+
+  if (primaryTable) {
+    widgets.push(
+      createDashboardWidget(primaryTable.id, {
+        span: charts.length > 0 ? 2 : 4,
+      }),
+    );
+  }
+  for (const chart of charts) {
+    widgets.push(
+      createDashboardWidget(chart.id, {
+        span: !primaryTable && charts.length === 1 ? 4 : 2,
+      }),
+    );
+  }
+  for (const table of otherTables) {
+    widgets.push(createDashboardWidget(table.id, { span: 2 }));
+  }
+  return widgets.slice(0, DASHBOARD_MAX_WIDGETS);
+}
+
+export function createDashboardView(
+  db: DatabaseData,
+  name = "管理面板",
+): ViewConfig {
+  const view = createView(name);
+  view.type = "dashboard";
+  view.showCalculations = false;
+  view.dashboard = { widgets: recommendedDashboardWidgets(db) };
+  return view;
+}
+
+export function dashboardWidgetView(
+  db: DatabaseData,
+  widget: DashboardWidget,
+): ViewConfig | null {
+  return db.views.find((view) => view.id === widget.viewId && view.type !== "dashboard") || null;
+}
+
+export function duplicateDashboardWidgets(widgets: DashboardWidget[]): DashboardWidget[] {
+  return widgets.map((widget) => ({ ...widget, id: uid("widget") }));
+}
+
+/** Drop widgets whose source view no longer exists (for example after a view is deleted). */
+export function pruneDashboardWidgets(db: DatabaseData, removedViewId: string): void {
+  for (const view of db.views) {
+    if (view.type !== "dashboard" || !view.dashboard) continue;
+    view.dashboard.widgets = view.dashboard.widgets.filter(
+      (widget) => widget.viewId !== removedViewId,
+    );
+  }
 }
 
 export function createDatabase(title = "未命名数据库"): DatabaseData {
@@ -424,6 +515,18 @@ export function createSampleDatabase(title = "任务追踪"): DatabaseData {
   };
 
   db.views.push(focusView, groupedView, lineView, pieView);
+
+  const dashboardView = createView("管理面板");
+  dashboardView.type = "dashboard";
+  dashboardView.dashboard = {
+    widgets: [
+      createDashboardWidget(firstView.id, { span: 4 }),
+      createDashboardWidget(lineView.id, { span: 2 }),
+      createDashboardWidget(pieView.id, { span: 2 }),
+    ],
+  };
+  db.views.push(dashboardView);
+
   db.activeViewId = firstView.id;
   return db;
 }
@@ -1352,6 +1455,7 @@ export function normalizeDatabase(raw: unknown): DatabaseData {
   const rawViews = Array.isArray(input.views) ? input.views : [];
   const views: ViewConfig[] = [];
   const usedViewIds = new Set<string>();
+  const pendingDashboards: Array<{ view: ViewConfig; raw: unknown }> = [];
   for (const rawView of rawViews) {
     if (!rawView || typeof rawView !== "object") continue;
     const view = rawView as Partial<ViewConfig>;
@@ -1381,15 +1485,18 @@ export function normalizeDatabase(raw: unknown): DatabaseData {
       view.calculations && typeof view.calculations === "object"
         ? { ...view.calculations }
         : {};
-    const viewType: ViewType = view.type === "chart" ? "chart" : "table";
-    views.push({
+    const viewType: ViewType =
+      view.type === "chart" ? "chart" : view.type === "dashboard" ? "dashboard" : "table";
+    const normalized: ViewConfig = {
       id: ensureUniqueId(view.id, "view", usedViewIds),
       name:
         typeof view.name === "string" && view.name.trim()
           ? view.name.trim()
           : viewType === "chart"
             ? "图表"
-            : "表格",
+            : viewType === "dashboard"
+              ? "管理面板"
+              : "表格",
       type: viewType,
       filters: filters.map((rule) => ({
         id: typeof rule.id === "string" ? rule.id : uid("filter"),
@@ -1414,13 +1521,49 @@ export function normalizeDatabase(raw: unknown): DatabaseData {
       collapsedGroups: Array.isArray(view.collapsedGroups) ? view.collapsedGroups : [],
       wrapText: view.wrapText === true,
       chart: normalizeChartConfig(view.chart, properties, viewType),
-    });
+      dashboard: { widgets: [] },
+    };
+    if (viewType === "dashboard") {
+      pendingDashboards.push({ view: normalized, raw: view.dashboard });
+    }
+    views.push(normalized);
   }
 
   if (views.length === 0) {
     const view = fallback.views[0];
     view.hiddenProperties = [];
     views.push(view);
+  }
+
+  const viewById = new Map(views.map((view) => [view.id, view]));
+  for (const pending of pendingDashboards) {
+    const rawDashboard =
+      pending.raw && typeof pending.raw === "object"
+        ? (pending.raw as Partial<DashboardConfig>)
+        : {};
+    const rawWidgets = Array.isArray(rawDashboard.widgets) ? rawDashboard.widgets : [];
+    const usedWidgetIds = new Set<string>();
+    const widgets: DashboardWidget[] = [];
+    for (const rawWidget of rawWidgets) {
+      if (widgets.length >= DASHBOARD_MAX_WIDGETS) break;
+      if (!rawWidget || typeof rawWidget !== "object") continue;
+      const widget = rawWidget as Partial<DashboardWidget>;
+      if (typeof widget.viewId !== "string") continue;
+      const source = viewById.get(widget.viewId);
+      if (!source || source.type === "dashboard") continue;
+      const span = Number(widget.span);
+      const height = widget.height;
+      widgets.push({
+        id: ensureUniqueId(widget.id, "widget", usedWidgetIds),
+        viewId: widget.viewId,
+        span: (span === 1 || span === 3 || span === 4 ? span : 2) as DashboardWidgetSpan,
+        height:
+          height === "compact" || height === "tall"
+            ? (height as DashboardWidgetHeight)
+            : "standard",
+      });
+    }
+    pending.view.dashboard = { widgets };
   }
 
   const activeViewId = views.some((view) => view.id === input.activeViewId)

@@ -1,7 +1,7 @@
 {
   "name": "one-database",
-  "version": "1.0.0",
-  "description": "A Notion-style database for Obsidian with table, line and pie views.",
+  "version": "1.1.0",
+  "description": "A Notion-style database for Obsidian with table, chart and dashboard views.",
   "author": "One Two Three",
   "private": true,
   "scripts": {

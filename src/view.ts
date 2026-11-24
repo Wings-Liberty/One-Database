@@ -7,12 +7,14 @@ import {
   calculationOptions,
   cellText,
   createChartView,
+  createDashboardView,
   createRow,
   createView,
   csvForView,
   dateKey,
   deepClone,
   defaultFilter,
+  duplicateDashboardWidgets,
   duplicateRow,
   ensureOption,
   filteredRows,
@@ -32,6 +34,7 @@ import {
   pad2,
   parseDatabaseJson,
   propertyById,
+  pruneDashboardWidgets,
   RowGroup,
   serializeDatabase,
   setCell,
@@ -46,6 +49,7 @@ import {
   CHART_AGGREGATION_LABELS,
   CHART_DATE_GRAIN_LABELS,
   CHART_KIND_LABELS,
+  DASHBOARD_MAX_WIDGETS,
   CellValue,
   ChartAggregation,
   ChartDateGrain,
@@ -87,6 +91,7 @@ import {
 } from "./ui/dom";
 import { HelpModal, NewPropertyModal } from "./ui/forms";
 import { RowPageModal } from "./ui/row-page";
+import { DashboardRenderer } from "./ui/dashboard";
 
 const EMOJI_CHOICES = [
   "🗂️",
@@ -187,6 +192,8 @@ export class NotionTableView extends TextFileView {
   private chartXButton: HTMLButtonElement | null = null;
   private chartYButton: HTMLButtonElement | null = null;
   private chartGroupButton: HTMLButtonElement | null = null;
+  private dashboardRenderer: DashboardRenderer | null = null;
+  private dashboardEditMode = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: NotionTablePlugin) {
     super(leaf);
@@ -222,6 +229,8 @@ export class NotionTableView extends TextFileView {
     closeActivePopover();
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     this.teardownChart();
+    this.dashboardRenderer?.dispose();
+    this.dashboardRenderer = null;
     this.themeObserver?.disconnect();
     this.themeObserver = null;
     await this.flushToDisk();
@@ -236,6 +245,7 @@ export class NotionTableView extends TextFileView {
       if (mode === this.themeMode) return;
       this.themeMode = mode;
       if (this.activeView?.type === "chart") this.renderChartView();
+      else if (this.activeView?.type === "dashboard") this.renderDashboardView();
     });
     this.themeObserver.observe(document.body, {
       attributes: true,
@@ -296,6 +306,9 @@ export class NotionTableView extends TextFileView {
     this.tableQuerySignatureCache = "";
     this.tableLoadedCount = 0;
     this.tableLoadedRowCount = 0;
+    this.dashboardRenderer?.dispose();
+    this.dashboardRenderer = null;
+    this.dashboardEditMode = false;
   }
 
   setViewData(data: string, _clear: boolean): void {
@@ -437,6 +450,8 @@ export class NotionTableView extends TextFileView {
     closeActivePopover();
     this.closeEditor(false);
     this.teardownChart();
+    this.dashboardRenderer?.dispose();
+    this.dashboardRenderer = null;
     this.contentEl.empty();
     this.contentEl.addClass("nt-view");
     if (!this.db) {
@@ -457,11 +472,16 @@ export class NotionTableView extends TextFileView {
 
   private renderViewBody(): void {
     if (!this.activeView) return;
-    if (this.activeView.type === "chart") this.renderChartView();
+    if (this.activeView.type === "dashboard") this.renderDashboardView();
+    else if (this.activeView.type === "chart") this.renderChartView();
     else this.renderTable();
   }
 
   private renderBodyPreserveScroll(): void {
+    if (this.activeView?.type === "dashboard") {
+      this.renderDashboardView();
+      return;
+    }
     if (this.activeView?.type === "chart") {
       this.renderChartView();
       return;
@@ -589,13 +609,15 @@ export class NotionTableView extends TextFileView {
   private switchView(viewId: string): void {
     if (!this.db || viewId === this.db.activeViewId) return;
     this.db.activeViewId = viewId;
+    this.dashboardEditMode = false;
     this.selectedRows.clear();
     this.persist();
     this.renderAll();
   }
 
   private renderToolbar(page: HTMLElement): void {
-    if (this.activeView?.type === "chart") this.renderChartToolbar(page);
+    if (this.activeView?.type === "dashboard") this.renderDashboardToolbar(page);
+    else if (this.activeView?.type === "chart") this.renderChartToolbar(page);
     else this.renderTableToolbar(page);
   }
 
@@ -665,6 +687,148 @@ export class NotionTableView extends TextFileView {
     moreButton.addEventListener("click", () => this.openViewOptionsMenu(moreButton));
   }
 
+  private renderDashboardToolbar(page: HTMLElement): void {
+    const view = this.activeView!;
+    const toolbarWrap = page.createDiv({ cls: "nt-toolbar-wrap" });
+    const toolbar = toolbarWrap.createDiv({ cls: "nt-toolbar nt-dashboard-toolbar" });
+    const left = toolbar.createDiv({ cls: "nt-toolbar-left" });
+
+    const addButton = this.createToolbarButton(left, "plus", "添加组件");
+    addButton.addClass("nt-dashboard-add-button");
+    addButton.addEventListener("click", () => this.openAddWidgetMenu(addButton));
+
+    const editButton = this.createToolbarButton(
+      left,
+      this.dashboardEditMode ? "check" : "pencil",
+      this.dashboardEditMode ? "完成编辑" : "编辑布局",
+    );
+    editButton.addClass("nt-dashboard-edit-button");
+    editButton.toggleClass("is-active", this.dashboardEditMode);
+    editButton.addEventListener("click", () => {
+      this.dashboardEditMode = !this.dashboardEditMode;
+      this.renderAll();
+    });
+
+    const right = toolbar.createDiv({ cls: "nt-toolbar-right" });
+    this.tableCountEl = right.createDiv({ cls: "nt-toolbar-count" });
+    this.updateDashboardCount();
+
+    const moreButton = right.createEl("button", {
+      cls: "nt-icon-button",
+      attr: { type: "button", "aria-label": "管理面板选项", title: "管理面板选项" },
+    });
+    moreButton.append(iconEl("more-horizontal", "nt-icon"));
+    moreButton.addEventListener("click", () =>
+      this.openDashboardViewOptionsMenu(moreButton),
+    );
+
+    if (view.dashboard.widgets.length === 0) {
+      left.createSpan({
+        cls: "nt-dashboard-toolbar-note",
+        text: "添加表格或图表组件，搭建你的管理面板",
+      });
+    }
+  }
+
+  private updateDashboardCount(): void {
+    if (!this.tableCountEl || !this.db || !this.activeView) return;
+    const count = this.activeView.dashboard.widgets.length;
+    this.tableCountEl.setText(`${count} / ${DASHBOARD_MAX_WIDGETS} 个组件`);
+  }
+
+  private renderDashboardView(): void {
+    this.tableRenderToken += 1;
+    closeActivePopover();
+    this.teardownChart();
+    this.dashboardRenderer?.dispose();
+    this.dashboardRenderer = null;
+    if (!this.db || !this.tableHostEl || !this.activeView) return;
+    const host = this.tableHostEl;
+    const previousScroll =
+      host.querySelector<HTMLElement>(".nt-dashboard-inner")?.scrollTop ?? 0;
+    host.empty();
+    host.addClass("nt-dashboard-area");
+    host.removeClass("nt-chart-area");
+    host.removeClass("is-grouped");
+    this.currentRows = this.db.rows;
+    this.updateDashboardCount();
+    this.dashboardRenderer = new DashboardRenderer(
+      this.app,
+      host,
+      this.db,
+      this.activeView,
+      this.dashboardEditMode,
+      {
+        persist: () => this.persist(),
+        refresh: () => this.renderDashboardView(),
+        openView: (viewId) => this.switchView(viewId),
+        openRow: (row) => this.openRowPage(row),
+      },
+    );
+    this.dashboardRenderer.render();
+    if (previousScroll > 0) {
+      window.requestAnimationFrame(() => {
+        const inner = host.querySelector<HTMLElement>(".nt-dashboard-inner");
+        if (inner) inner.scrollTop = previousScroll;
+      });
+    }
+  }
+
+  private openAddWidgetMenu(anchor: HTMLElement): void {
+    this.dashboardRenderer?.openAddWidgetMenu(anchor);
+  }
+
+  private openDashboardViewOptionsMenu(anchor: HTMLElement): void {
+    if (!this.db) return;
+    const view = this.activeView!;
+    openPopover(anchor, "nt-menu-popover", (content, popover) => {
+      content.createDiv({ cls: "nt-menu-heading", text: "管理面板" });
+      this.menuItem(content, "plus", "添加组件", () => {
+        popover.close();
+        this.openAddWidgetMenu(anchor);
+      });
+      this.menuItem(content, "sparkles", "使用推荐布局", () => {
+        popover.close();
+        void this.dashboardRenderer?.applyRecommendedLayout();
+      });
+      this.menuItem(
+        content,
+        "trash-2",
+        "清空全部组件",
+        () => {
+          popover.close();
+          void this.dashboardRenderer?.clearWidgets();
+        },
+        { danger: true, disabled: view.dashboard.widgets.length === 0 },
+      );
+      content.createDiv({ cls: "nt-menu-divider" });
+      this.menuItem(content, "download", "导出全部记录为 CSV", () => {
+        popover.close();
+        this.exportCsv();
+      });
+      this.menuItem(content, "table-2", "改为表格视图", () => {
+        view.type = "table";
+        this.dashboardEditMode = false;
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      content.createDiv({ cls: "nt-menu-note", text: "组件只是视图的窗口，调整布局不会改动数据。" });
+    }, { width: 270, align: "end" });
+  }
+
+  /** Used by the command palette to add a dashboard to the open database. */
+  addDashboardView(): void {
+    if (!this.db) return;
+    const view = createDashboardView(this.db, this.uniqueViewName("管理面板"));
+    this.db.views.push(view);
+    this.db.activeViewId = view.id;
+    this.dashboardEditMode = false;
+    this.persist();
+    this.renderAll();
+    notify(`已新建「${view.name}」`);
+  }
+
   private createToolbarButton(
     parent: HTMLElement,
     icon: string,
@@ -687,6 +851,11 @@ export class NotionTableView extends TextFileView {
     reuseRows = true,
     ensureRowId?: string,
   ): void {
+    if (this.activeView?.type === "dashboard") {
+      this.renderDashboardView();
+      afterRender?.();
+      return;
+    }
     if (this.activeView?.type === "chart") {
       this.renderChartView();
       afterRender?.();
@@ -714,7 +883,7 @@ export class NotionTableView extends TextFileView {
    * the first batch so the new chunk size is visible from the top of the view.
    */
   refreshTablePageSize(): void {
-    if (!this.db || !this.tableHostEl || this.activeView?.type === "chart") return;
+    if (!this.db || !this.tableHostEl || this.activeView?.type !== "table") return;
     this.tableLoadedCount = 0;
     this.tableLoadedRowCount = 0;
     this.renderTable({ reuseRows: false, resetWindow: true });
@@ -1044,6 +1213,7 @@ export class NotionTableView extends TextFileView {
   }
 
   private viewIcon(view: ViewConfig): string {
+    if (view.type === "dashboard") return "layout-dashboard";
     if (view.type === "chart") {
       return view.chart.kind === "pie" ? "chart-pie" : "chart-line";
     }
@@ -2347,6 +2517,11 @@ export class NotionTableView extends TextFileView {
       notify("已添加一条记录，图表已更新");
       return;
     }
+    if (this.activeView?.type === "dashboard") {
+      this.renderDashboardView();
+      notify("已添加一条记录，管理面板已更新");
+      return;
+    }
     this.renderTablePreserveScroll(
       () => {
         if (!this.db) return;
@@ -2402,7 +2577,8 @@ export class NotionTableView extends TextFileView {
         this.persist();
       },
       onCloseRefresh: () => {
-        this.renderTablePreserveScroll(undefined, false);
+        if (this.activeView?.type === "dashboard") this.renderDashboardView();
+        else this.renderTablePreserveScroll(undefined, false);
       },
     });
     modal.open();
@@ -2435,6 +2611,11 @@ export class NotionTableView extends TextFileView {
     if (!this.db) return;
     openPopover(anchor, "nt-menu-popover", (content, popover) => {
       content.createDiv({ cls: "nt-menu-heading", text: this.db!.title });
+      this.menuItem(content, "layout-dashboard", "新建管理面板", () => {
+        popover.close();
+        this.addDashboardView();
+      });
+      content.createDiv({ cls: "nt-menu-divider" });
       this.menuItem(content, "circle-help", "使用帮助", () => {
         popover.close();
         new HelpModal(this.app).open();
@@ -2665,11 +2846,25 @@ export class NotionTableView extends TextFileView {
         this.renderAll();
       });
       content.createDiv({ cls: "nt-menu-divider" });
+      this.menuItem(content, "layout-dashboard", "管理面板", () => {
+        const view = createDashboardView(
+          this.db!,
+          this.uniqueViewName("管理面板"),
+        );
+        this.db!.views.push(view);
+        this.db!.activeViewId = view.id;
+        this.dashboardEditMode = false;
+        this.selectedRows.clear();
+        this.persist();
+        popover.close();
+        this.renderAll();
+      });
+      content.createDiv({ cls: "nt-menu-divider" });
       this.menuItem(content, "copy", "复制当前视图", () => {
         popover.close();
         this.duplicateActiveView();
       });
-      content.createDiv({ cls: "nt-menu-note", text: "支持表格、折线图和饼图视图。" });
+      content.createDiv({ cls: "nt-menu-note", text: "支持表格、折线图、饼图和管理面板视图。" });
     }, { width: 230 });
   }
 
@@ -2680,9 +2875,13 @@ export class NotionTableView extends TextFileView {
     source.name = this.uniqueViewName(`${source.name} 副本`);
     source.filters = source.filters.map((rule) => ({ ...rule, id: uid("filter") }));
     source.sorts = source.sorts.map((sort) => ({ ...sort, id: uid("sort") }));
+    if (source.type === "dashboard") {
+      source.dashboard.widgets = duplicateDashboardWidgets(source.dashboard.widgets);
+    }
     const sourceIndex = this.db.views.findIndex((view) => view.id === this.activeView!.id);
     this.db.views.splice(sourceIndex + 1, 0, source);
     this.db.activeViewId = source.id;
+    this.dashboardEditMode = false;
     this.selectedRows.clear();
     this.persist();
     this.renderAll();
@@ -2737,9 +2936,13 @@ export class NotionTableView extends TextFileView {
     copy.name = this.uniqueViewName(`${view.name} 副本`);
     copy.filters = copy.filters.map((rule) => ({ ...rule, id: uid("filter") }));
     copy.sorts = copy.sorts.map((sort) => ({ ...sort, id: uid("sort") }));
+    if (copy.type === "dashboard") {
+      copy.dashboard.widgets = duplicateDashboardWidgets(copy.dashboard.widgets);
+    }
     const index = this.db.views.findIndex((item) => item.id === view.id);
     this.db.views.splice(index + 1, 0, copy);
     this.db.activeViewId = copy.id;
+    this.dashboardEditMode = false;
     this.selectedRows.clear();
     this.persist();
     this.renderAll();
@@ -2755,7 +2958,9 @@ export class NotionTableView extends TextFileView {
     );
     if (!confirmed || !this.db) return;
     this.db.views = this.db.views.filter((item) => item.id !== view.id);
+    pruneDashboardWidgets(this.db, view.id);
     if (this.db.activeViewId === view.id) this.db.activeViewId = this.db.views[0].id;
+    this.dashboardEditMode = false;
     this.persist();
     this.renderAll();
   }

@@ -93,7 +93,7 @@ export interface SortRule {
   direction: "asc" | "desc";
 }
 
-export type ViewType = "table" | "chart";
+export type ViewType = "table" | "chart" | "dashboard";
 export type ChartKind = "line" | "pie";
 export type ChartAggregation = "sum" | "average" | "count" | "min" | "max" | "median";
 export type ChartDateGrain = "day" | "month" | "year";
@@ -107,6 +107,40 @@ export interface ChartConfig {
   dateGrain: ChartDateGrain;
   showLegend: boolean;
 }
+
+export type DashboardWidgetSpan = 1 | 2 | 3 | 4;
+export type DashboardWidgetHeight = "compact" | "standard" | "tall";
+
+/**
+ * A dashboard widget shows one of the database's table/chart views in a card.
+ * The widget only stores layout; the rendered data always comes from `viewId`,
+ * so editing the source view keeps every dashboard in sync.
+ */
+export interface DashboardWidget {
+  id: string;
+  viewId: string;
+  span: DashboardWidgetSpan;
+  height: DashboardWidgetHeight;
+}
+
+export interface DashboardConfig {
+  widgets: DashboardWidget[];
+}
+
+export const DASHBOARD_MAX_WIDGETS = 12;
+
+export const DASHBOARD_SPAN_LABELS: Record<DashboardWidgetSpan, string> = {
+  1: "1/4 宽",
+  2: "1/2 宽",
+  3: "3/4 宽",
+  4: "整行",
+};
+
+export const DASHBOARD_HEIGHT_LABELS: Record<DashboardWidgetHeight, string> = {
+  compact: "紧凑",
+  standard: "标准",
+  tall: "高",
+};
 
 export interface ViewConfig {
   id: string;
@@ -123,6 +157,7 @@ export interface ViewConfig {
   collapsedGroups: string[];
   wrapText: boolean;
   chart: ChartConfig;
+  dashboard: DashboardConfig;
 }
 
 export interface DatabaseData {

@@ -3377,3 +3377,699 @@ body.nt-resizing-column * {
   color: var(--text-error, #d44c47);
 }
 
+
+/* =========================================================
+   Dashboard / 管理面板
+   ========================================================= */
+
+.nt-dashboard-area {
+  padding-top: 14px;
+  overflow: hidden;
+}
+
+.nt-dashboard-inner {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 6px;
+  scrollbar-gutter: stable;
+}
+
+.nt-dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-content: start;
+  gap: 12px;
+  padding: 1px;
+}
+
+.nt-dash-widget {
+  --nt-dash-height: 340px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: var(--nt-dash-height);
+  overflow: hidden;
+  border: 1px solid var(--nt-border);
+  border-radius: 8px;
+  background: var(--nt-bg);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.nt-dash-widget:hover {
+  border-color: var(--nt-border-strong);
+  box-shadow: 0 1px 4px rgba(15, 15, 15, 0.06);
+}
+
+.nt-dash-span-1 {
+  grid-column: span 1;
+}
+
+.nt-dash-span-2 {
+  grid-column: span 2;
+}
+
+.nt-dash-span-3 {
+  grid-column: span 3;
+}
+
+.nt-dash-span-4 {
+  grid-column: span 4;
+}
+
+.nt-dash-height-compact {
+  --nt-dash-height: 250px;
+}
+
+.nt-dash-height-standard {
+  --nt-dash-height: 340px;
+}
+
+.nt-dash-height-tall {
+  --nt-dash-height: 500px;
+}
+
+/* ---------- Widget header ---------- */
+
+.nt-dash-widget-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 42px;
+  padding: 7px 7px 5px 11px;
+}
+
+.nt-dash-widget-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--nt-text-secondary);
+}
+
+.nt-dash-widget-icon .svg-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.nt-dash-widget-title {
+  min-width: 0;
+  max-width: 58%;
+  padding: 2px 3px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--nt-text);
+  font-family: var(--nt-font);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.nt-dash-widget-title:hover {
+  background: var(--nt-hover);
+}
+
+.nt-dash-widget-meta {
+  min-width: 0;
+  max-width: 38%;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--nt-text-faint);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nt-dash-widget-menu {
+  flex: 0 0 auto;
+  width: 25px;
+  height: 25px;
+  opacity: 0;
+  transition: opacity 100ms ease, background 100ms ease;
+}
+
+.nt-dash-widget:hover .nt-dash-widget-menu,
+.nt-dash-widget-menu:focus-visible,
+.nt-dashboard-grid.is-editing .nt-dash-widget-menu {
+  opacity: 1;
+}
+
+.nt-dash-drag-handle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 24px;
+  margin-left: -7px;
+  border-radius: 3px;
+  color: var(--nt-text-faint);
+  cursor: grab;
+}
+
+.nt-dash-drag-handle:hover {
+  background: var(--nt-hover);
+  color: var(--nt-text);
+}
+
+.nt-dash-drag-handle:active {
+  cursor: grabbing;
+}
+
+.nt-dash-drag-handle .svg-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* ---------- Widget body ---------- */
+
+.nt-dash-widget-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0 10px 7px;
+}
+
+.nt-dash-chart-body {
+  padding: 0 3px 3px;
+}
+
+.nt-dash-chart-canvas {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 140px;
+}
+
+.nt-dash-chart-error {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--nt-red);
+  font-size: 12px;
+  text-align: center;
+}
+
+.nt-dash-widget-empty {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px;
+  color: var(--nt-text-secondary);
+  text-align: center;
+}
+
+.nt-dash-widget-empty .nt-icon {
+  color: var(--nt-text-faint);
+}
+
+.nt-dash-widget-empty strong {
+  color: var(--nt-text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.nt-dash-widget-empty p {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* ---------- Table preview ---------- */
+
+.nt-dash-table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0 -2px;
+  overflow: auto;
+}
+
+.nt-dash-table {
+  width: 100%;
+  margin: 0;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  color: var(--nt-text);
+  font-size: 12px;
+}
+
+.nt-dash-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 27px;
+  padding: 0 7px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--nt-border);
+  background: var(--nt-bg);
+  color: var(--nt-text-faint);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nt-dash-table thead th.is-title {
+  width: 34%;
+}
+
+.nt-dash-table thead th:not(.is-title) {
+  width: 22%;
+}
+
+.nt-dash-table td {
+  height: 29px;
+  padding: 0 7px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--nt-border);
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.nt-dash-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.nt-dash-row {
+  cursor: pointer;
+}
+
+.nt-dash-row:hover td {
+  background: var(--nt-hover);
+}
+
+.nt-dash-row:focus-visible {
+  outline: 2px solid var(--nt-blue);
+  outline-offset: -2px;
+}
+
+.nt-dash-table .nt-pill {
+  min-height: 17px;
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.nt-dash-title-text {
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+}
+
+.nt-dash-row-icon {
+  margin-right: 4px;
+}
+
+.nt-dash-plain {
+  color: var(--nt-text-secondary);
+}
+
+.nt-dash-table td.is-number {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.nt-dash-table td.is-empty {
+  color: var(--nt-text-faint);
+  opacity: 0.55;
+}
+
+.nt-dash-checkbox {
+  display: inline-flex;
+  color: var(--nt-blue);
+}
+
+.nt-dash-checkbox.is-muted {
+  color: var(--nt-text-faint);
+  opacity: 0.55;
+}
+
+.nt-dash-checkbox .svg-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.nt-dash-more {
+  margin-left: 3px;
+  color: var(--nt-text-faint);
+  font-size: 10.5px;
+}
+
+.nt-dash-table-empty td {
+  height: 64px;
+  color: var(--nt-text-faint);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.nt-dash-widget-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 27px;
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px solid var(--nt-border);
+}
+
+.nt-dash-open-view {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 23px;
+  margin-left: -5px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--nt-text-secondary);
+  font-family: var(--nt-font);
+  font-size: 11.5px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.nt-dash-open-view:hover {
+  background: var(--nt-hover);
+  color: var(--nt-text);
+}
+
+.nt-dash-open-view .svg-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* ---------- Empty dashboard ---------- */
+
+.nt-dashboard-empty {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 360px;
+  margin: 4px 0 14px;
+  padding: 44px 24px;
+  border: 1px dashed var(--nt-border-strong);
+  border-radius: 10px;
+  background: var(--nt-bg-secondary);
+  text-align: center;
+}
+
+.nt-dashboard-empty-icon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 4px;
+  border: 1px solid var(--nt-border);
+  border-radius: 14px;
+  background: var(--nt-bg);
+  color: var(--nt-blue);
+}
+
+.nt-dashboard-empty-icon .svg-icon {
+  width: 26px;
+  height: 26px;
+}
+
+.nt-dashboard-empty h3 {
+  margin: 0;
+  color: var(--nt-text);
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.nt-dashboard-empty p {
+  max-width: 500px;
+  margin: 0;
+  color: var(--nt-text-secondary);
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+
+.nt-dashboard-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.nt-dashboard-empty-note {
+  margin-top: 4px;
+  color: var(--nt-text-faint);
+  font-size: 11px;
+}
+
+.nt-dash-add-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 150px;
+  border: 1px dashed var(--nt-border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--nt-text-secondary);
+  font-family: var(--nt-font);
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: none;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.nt-dash-add-tile:hover {
+  border-color: var(--nt-blue);
+  background: var(--nt-bg-secondary);
+  color: var(--nt-blue);
+}
+
+.nt-dash-add-tile .svg-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.nt-dashboard-hint {
+  padding: 10px 2px 0;
+  color: var(--nt-text-faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* ---------- Edit mode ---------- */
+
+.nt-dashboard-grid.is-editing .nt-dash-widget {
+  border-style: dashed;
+}
+
+.nt-dash-widget.is-dragging {
+  opacity: 0.45;
+}
+
+.nt-dash-widget.is-drop-before {
+  box-shadow: inset 3px 0 0 var(--nt-blue);
+}
+
+.nt-dash-widget.is-drop-after {
+  box-shadow: inset -3px 0 0 var(--nt-blue);
+}
+
+.nt-dash-widget.is-broken {
+  border-color: var(--nt-red);
+}
+
+.nt-dashboard-toolbar-note {
+  margin-left: 9px;
+  color: var(--nt-text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.nt-dashboard-add-button {
+  color: var(--nt-text);
+}
+
+.nt-dashboard-add-button .nt-button-icon {
+  color: var(--nt-blue);
+}
+
+.nt-dashboard-edit-button.is-active {
+  background: rgba(35, 131, 226, 0.1);
+  color: var(--nt-blue);
+}
+
+/* ---------- Widget size controls ---------- */
+
+.nt-dash-size-row {
+  display: flex;
+  gap: 4px;
+  margin: 2px 0 8px;
+}
+
+.nt-dash-size-button {
+  flex: 1 1 0;
+  height: 27px;
+  padding: 0 4px;
+  overflow: hidden;
+  border: 1px solid var(--nt-border);
+  border-radius: 4px;
+  background: var(--nt-bg);
+  color: var(--nt-text-secondary);
+  font-family: var(--nt-font);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.nt-dash-size-button:hover {
+  background: var(--nt-hover);
+}
+
+.nt-dash-size-button.is-active {
+  border-color: var(--nt-blue);
+  background: rgba(35, 131, 226, 0.1);
+  color: var(--nt-blue);
+}
+
+.nt-dash-widget-popover .nt-menu-heading:not(:first-child) {
+  margin-top: 2px;
+}
+
+/* ---------- Dashboard responsive ---------- */
+
+@media (max-width: 1200px) {
+  .nt-dashboard-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .nt-dash-span-3,
+  .nt-dash-span-4 {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 760px) {
+  .nt-dashboard-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .nt-dash-span-1,
+  .nt-dash-span-2,
+  .nt-dash-span-3,
+  .nt-dash-span-4 {
+    grid-column: span 1;
+  }
+
+  .nt-dashboard-empty {
+    min-height: 300px;
+    padding: 28px 16px;
+  }
+
+  .nt-dashboard-toolbar-note {
+    display: none;
+  }
+
+  .nt-dash-widget-title {
+    max-width: 52%;
+  }
+
+  .nt-dash-widget-meta {
+    max-width: 32%;
+  }
+}
+
+.nt-dash-inline-icon {
+  display: inline-flex;
+  margin-right: 4px;
+  vertical-align: -2px;
+  color: var(--nt-text-faint);
+}
+
+.nt-dash-inline-icon .svg-icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* Obsidian's base `button:not(.clickable-icon)` rule outranks single-class
+   selectors, so dashboard chrome needs one extra class to stay flat. */
+.nt-dash-widget .nt-dash-widget-title {
+  background: transparent;
+}
+
+.nt-dash-widget .nt-dash-widget-title:hover {
+  background: var(--nt-hover);
+}
+
+.nt-dash-widget-footer .nt-dash-open-view {
+  background: transparent;
+}
+
+.nt-dash-widget-footer .nt-dash-open-view:hover {
+  background: var(--nt-hover);
+}
+
+.nt-dashboard-grid .nt-dash-add-tile {
+  background: transparent;
+}
+
+.nt-dashboard-grid .nt-dash-add-tile:hover {
+  background: var(--nt-bg-secondary);
+}
+
+.nt-dashboard-empty .nt-button {
+  background: var(--nt-bg);
+}
+
+.nt-dashboard-empty .nt-button:hover {
+  background: var(--nt-bg-secondary);
+}
+
+.nt-dashboard-empty .nt-button-primary,
+.nt-dashboard-empty .nt-button-primary:hover {
+  border-color: var(--nt-blue);
+  background: var(--nt-blue);
+  color: #fff;
+}
+
+.nt-dashboard-empty .nt-button-primary:hover {
+  border-color: var(--nt-blue-hover);
+  background: var(--nt-blue-hover);
+}
+
+.nt-dashboard-empty .nt-button-quiet {
+  background: transparent;
+}
+
+.nt-popover .nt-dash-size-button {
+  background: var(--nt-bg);
+}
+
+.nt-popover .nt-dash-size-button:hover {
+  background: var(--nt-hover);
+}
+
+.nt-popover .nt-dash-size-button.is-active {
+  border-color: var(--nt-blue);
+  background: rgba(35, 131, 226, 0.1);
+  color: var(--nt-blue);
+}

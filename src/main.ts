@@ -59,6 +59,18 @@ export default class NotionTablePlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "create-dashboard-view",
+      name: "为当前数据库新建管理面板",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(NotionTableView);
+        if (!view) return false;
+        if (checking) return true;
+        view.addDashboardView();
+        return true;
+      },
+    });
+
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu: Menu, file) => {
         if (file instanceof TFolder) {

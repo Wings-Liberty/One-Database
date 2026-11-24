@@ -1,9 +1,9 @@
 {
   "id": "one-database",
   "name": "One Database",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.7.7",
-  "description": "在 Obsidian 中创建 Notion 风格的数据库：表格与图表视图、属性类型、筛选、排序与行详情。",
+  "description": "在 Obsidian 中创建 Notion 风格的数据库：表格、图表与管理面板视图、属性类型、筛选、排序与行详情。",
   "author": "One Two Three",
   "isDesktopOnly": false
 }
